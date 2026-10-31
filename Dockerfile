@@ -1,7 +1,10 @@
 # ==========================================
 # Stage 1: Build the Go binary
 # ==========================================
-FROM golang:1.24-alpine AS builder
+FROM golang:alpine AS builder
+
+# Enable automatic Go toolchain management
+ENV GOTOOLCHAIN=auto
 
 WORKDIR /build
 
@@ -40,8 +43,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY workers/pyrofork/requirements.txt ./workers/pyrofork/requirements.txt
 COPY workers/telethon/requirements.txt ./workers/telethon/requirements.txt
 
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
+RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip && \
+    pip install --no-cache-dir --root-user-action=ignore \
     -r ./workers/pyrofork/requirements.txt \
     -r ./workers/telethon/requirements.txt
 
@@ -62,4 +65,3 @@ USER appuser
 
 # Use exec form ENTRYPOINT for clean SIGTERM signal propagation
 ENTRYPOINT ["/app/bot"]
-
