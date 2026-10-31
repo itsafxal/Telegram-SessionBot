@@ -25,6 +25,16 @@ type Provider struct {
 	mu            sync.Mutex
 }
 
+// cleanPhoneNumber strips whitespace, dashes, and parentheses while preserving valid digits and '+' prefix.
+func cleanPhoneNumber(phone string) string {
+	phone = strings.TrimSpace(phone)
+	phone = strings.ReplaceAll(phone, " ", "")
+	phone = strings.ReplaceAll(phone, "-", "")
+	phone = strings.ReplaceAll(phone, "(", "")
+	phone = strings.ReplaceAll(phone, ")", "")
+	return phone
+}
+
 // New creates a new native Gogram provider instance.
 func New(ctx context.Context, apiID int32, apiHash string, pythonPath string, timeout time.Duration) (providers.Provider, error) {
 	client, err := telegram.NewClient(telegram.ClientConfig{
@@ -59,6 +69,39 @@ func (p *Provider) SupportsQR() bool {
 	return true
 }
 
+// sendCodeWithRetry calls AuthSendCode with non-nil CodeSettings and handles DC migration and connection initialization.
+func (p *Provider) sendCodeWithRetry(phoneNumber string, maxRetries int) (string, error) {
+	settings := &telegram.CodeSettings{
+		AllowAppHash:  true,
+		CurrentNumber: true,
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		sentCode, err := p.client.AuthSendCode(phoneNumber, p.apiID, p.apiHash, settings)
+		if err != nil {
+			if telegram.MatchError(err, "CONNECTION_NOT_INITED") {
+				if initErr := p.client.InitialRequest(); initErr == nil {
+					continue
+				}
+			}
+			if telegram.MatchError(err, "DC_MIGRATE") || telegram.MatchError(err, "PHONE_MIGRATE") || telegram.MatchError(err, "NETWORK_MIGRATE") {
+				continue
+			}
+			return "", err
+		}
+
+		switch obj := sentCode.(type) {
+		case *telegram.AuthSentCodeObj:
+			return obj.PhoneCodeHash, nil
+		case *telegram.AuthSentCodePaymentRequired:
+			return obj.PhoneCodeHash, nil
+		default:
+			return "", fmt.Errorf("unexpected response type from Telegram: %T", sentCode)
+		}
+	}
+	return "", errors.New("maximum DC migration retry attempts exceeded")
+}
+
 func (p *Provider) StartPhoneAuth(ctx context.Context, phoneNumber string) (*providers.AuthResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -67,20 +110,63 @@ func (p *Provider) StartPhoneAuth(ctx context.Context, phoneNumber string) (*pro
 		return nil, errors.New("gogram client is closed")
 	}
 
-	p.phoneNumber = strings.TrimSpace(phoneNumber)
-	sentCode, err := p.client.AuthSendCode(p.phoneNumber, p.apiID, p.apiHash, nil)
+	if p.apiID <= 0 || p.apiHash == "" {
+		return &providers.AuthResult{
+			Status:       providers.StatusError,
+			ErrorMessage: "Invalid API credentials configured.",
+		}, nil
+	}
+
+	cleanedPhone := cleanPhoneNumber(phoneNumber)
+	if cleanedPhone == "" {
+		return &providers.AuthResult{
+			Status:       providers.StatusError,
+			ErrorMessage: "Phone number cannot be empty.",
+		}, nil
+	}
+
+	// Ensure TCP connection is active
+	if !p.client.IsConnected() {
+		if _, err := p.client.Conn(); err != nil {
+			return &providers.AuthResult{
+				Status:       providers.StatusError,
+				ErrorMessage: fmt.Sprintf("Failed to establish connection to Telegram: %v", err),
+			}, nil
+		}
+	}
+
+	p.phoneNumber = cleanedPhone
+	phoneCodeHash, err := p.sendCodeWithRetry(p.phoneNumber, 3)
 	if err != nil {
 		errStr := err.Error()
 		if strings.Contains(errStr, "PHONE_NUMBER_INVALID") {
 			return &providers.AuthResult{
 				Status:       providers.StatusError,
-				ErrorMessage: "Invalid phone number provided.",
+				ErrorMessage: "Invalid phone number provided. Please ensure it includes your country code (e.g. +1234567890).",
+			}, nil
+		}
+		if strings.Contains(errStr, "PHONE_NUMBER_UNOCCUPIED") {
+			return &providers.AuthResult{
+				Status:       providers.StatusError,
+				ErrorMessage: "This phone number is not registered on Telegram. Please sign up in the official Telegram app first.",
+			}, nil
+		}
+		if strings.Contains(errStr, "PHONE_NUMBER_BANNED") {
+			return &providers.AuthResult{
+				Status:       providers.StatusError,
+				ErrorMessage: "This phone number has been banned by Telegram.",
 			}, nil
 		}
 		if strings.Contains(errStr, "FLOOD_WAIT") {
 			return &providers.AuthResult{
 				Status:       providers.StatusError,
-				ErrorMessage: "Telegram flood wait: please wait before retrying.",
+				ErrorMessage: "Telegram flood wait limit reached. Please wait before retrying.",
+			}, nil
+		}
+		if strings.Contains(errStr, "API_ID_INVALID") || strings.Contains(errStr, "API_ID_PUBLISHED_FLOOD") {
+			return &providers.AuthResult{
+				Status:       providers.StatusError,
+				ErrorMessage: "Invalid API credentials configured.",
 			}, nil
 		}
 		return &providers.AuthResult{
@@ -89,15 +175,11 @@ func (p *Provider) StartPhoneAuth(ctx context.Context, phoneNumber string) (*pro
 		}, nil
 	}
 
-	if obj, ok := sentCode.(*telegram.AuthSentCodeObj); ok {
-		p.phoneCodeHash = obj.PhoneCodeHash
-		return &providers.AuthResult{
-			Status:        providers.StatusNeedOTP,
-			PhoneCodeHash: obj.PhoneCodeHash,
-		}, nil
-	}
-
-	return nil, errors.New("unexpected response from Telegram server during send code")
+	p.phoneCodeHash = phoneCodeHash
+	return &providers.AuthResult{
+		Status:        providers.StatusNeedOTP,
+		PhoneCodeHash: phoneCodeHash,
+	}, nil
 }
 
 func (p *Provider) StartQRAuth(ctx context.Context) (*providers.AuthResult, error) {
@@ -202,6 +284,20 @@ func (p *Provider) SubmitOTP(ctx context.Context, phoneCode string) (*providers.
 	}
 
 	phoneCode = strings.TrimSpace(phoneCode)
+	if phoneCode == "" {
+		return &providers.AuthResult{
+			Status:       providers.StatusError,
+			ErrorMessage: "Verification code cannot be empty.",
+		}, nil
+	}
+
+	if p.phoneCodeHash == "" {
+		return &providers.AuthResult{
+			Status:       providers.StatusError,
+			ErrorMessage: "Missing phone code hash. Please request a new code.",
+		}, nil
+	}
+
 	_, err := p.client.AuthSignIn(p.phoneNumber, p.phoneCodeHash, phoneCode, nil)
 	if err != nil {
 		errStr := err.Error()
@@ -213,7 +309,7 @@ func (p *Provider) SubmitOTP(ctx context.Context, phoneCode string) (*providers.
 		if strings.Contains(errStr, "PHONE_CODE_INVALID") {
 			return &providers.AuthResult{
 				Status:       providers.StatusError,
-				ErrorMessage: "Invalid verification code.",
+				ErrorMessage: "Invalid verification code. Please check the code and try again.",
 			}, nil
 		}
 		if strings.Contains(errStr, "PHONE_CODE_EXPIRED") {
@@ -222,11 +318,19 @@ func (p *Provider) SubmitOTP(ctx context.Context, phoneCode string) (*providers.
 				ErrorMessage: "Verification code has expired. Please request a new one.",
 			}, nil
 		}
+		if strings.Contains(errStr, "PHONE_CODE_EMPTY") {
+			return &providers.AuthResult{
+				Status:       providers.StatusError,
+				ErrorMessage: "Verification code cannot be empty.",
+			}, nil
+		}
 		return &providers.AuthResult{
 			Status:       providers.StatusError,
 			ErrorMessage: fmt.Sprintf("Authentication failed: %s", errStr),
 		}, nil
 	}
+
+	_ = p.client.SaveSession(true)
 
 	return &providers.AuthResult{
 		Status: providers.StatusSuccess,
@@ -262,7 +366,7 @@ func (p *Provider) SubmitPassword(ctx context.Context, password string) (*provid
 		if strings.Contains(err.Error(), "PASSWORD_HASH_INVALID") {
 			return &providers.AuthResult{
 				Status:       providers.StatusError,
-				ErrorMessage: "Incorrect two-step verification password.",
+				ErrorMessage: "Incorrect two-step verification password. Please try again.",
 			}, nil
 		}
 		return &providers.AuthResult{
@@ -270,6 +374,8 @@ func (p *Provider) SubmitPassword(ctx context.Context, password string) (*provid
 			ErrorMessage: fmt.Sprintf("2FA verification failed: %s", err.Error()),
 		}, nil
 	}
+
+	_ = p.client.SaveSession(true)
 
 	return &providers.AuthResult{
 		Status: providers.StatusSuccess,
@@ -338,6 +444,10 @@ func (p *Provider) Cleanup() {
 		_ = p.client.Terminate()
 		p.client = nil
 	}
+	p.phoneNumber = ""
+	p.phoneCodeHash = ""
+	p.qrToken = nil
+	p.qrExpires = 0
 }
 
 func init() {
