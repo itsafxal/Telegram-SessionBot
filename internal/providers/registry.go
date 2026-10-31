@@ -113,3 +113,18 @@ func DisplayName(idOrName string) string {
 		return idOrName
 	}
 }
+
+// SupportsQR returns whether a provider natively supports QR-based login based on static capability metadata.
+func SupportsQR(name string) bool {
+	canonical := NormalizeName(name)
+	switch canonical {
+	case InternalIDPyrofork:
+		return false
+	case InternalIDTelethon:
+		return true
+	case InternalIDGogram:
+		return true
+	default:
+		return false
+	}
+}

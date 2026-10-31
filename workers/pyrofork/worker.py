@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import sys
 import traceback
@@ -156,6 +157,77 @@ class PyroforkWorker:
             except Exception:
                 pass
 
+    async def handle_get_me(self, payload: dict) -> dict:
+        if not self.client:
+            return {"status": "error", "error": "Client not initialized"}
+        try:
+            await self.ensure_connected()
+            me = await self.client.get_me()
+            if not me:
+                return {"status": "error", "error": "Failed to retrieve account details"}
+            return {
+                "status": "ok",
+                "data": {
+                    "id": me.id,
+                    "first_name": me.first_name or "",
+                    "last_name": me.last_name or "",
+                    "username": me.username or "",
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": f"Failed to get account details: {str(e)}"}
+
+    async def handle_send_to_saved_messages(self, payload: dict) -> dict:
+        if not self.client:
+            return {"status": "error", "error": "Client not initialized"}
+
+        session_str = str(payload.get("session", "")).strip()
+        provider_name = str(payload.get("provider_name", "Pyrogram")).strip()
+        if not session_str:
+            return {"status": "error", "error": "Session string cannot be empty"}
+
+        try:
+            await self.ensure_connected()
+            me = await self.client.get_me()
+            user_id = me.id if me else 0
+            name = f"{me.first_name or ''} {me.last_name or ''}".strip() if me else "Authorized Account"
+            username_str = f"@{me.username}" if (me and me.username) else "N/A"
+            now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            text = (
+                f"🔐 **Universal Telegram MTProto Session**\n\n"
+                f"• **Provider:** {provider_name}\n"
+                f"• **Account ID:** `{user_id}`\n"
+                f"• **Account Name:** {name}\n"
+                f"• **Username:** {username_str}\n"
+                f"• **Generated At:** {now_utc}\n"
+                f"• **Status:** ✅ Validated & Verified\n\n"
+                f"📋 **Your String Session:**\n"
+                f"```{session_str}```\n\n"
+                f"⚠️ **Security Advisory:**\n"
+                f"This String Session grants full access to your Telegram account. "
+                f"Never share it with anyone or paste it into untrusted bots or websites."
+            )
+
+            # In Pyrogram, sending to "me" sends to Saved Messages (InputPeerSelf)
+            sent_msg = await self.client.send_message("me", text)
+            if not sent_msg or not getattr(sent_msg, "id", None):
+                return {"status": "error", "error": "Telegram server did not return a valid message ID"}
+
+            # Verify delivery by retrieving the message back from Saved Messages
+            verify_msg = await self.client.get_messages("me", message_ids=sent_msg.id)
+            if not verify_msg or getattr(verify_msg, "empty", False) or verify_msg.id != sent_msg.id:
+                return {"status": "error", "error": "Delivery to Saved Messages could not be verified"}
+
+            return {
+                "status": "ok",
+                "data": {
+                    "message_id": sent_msg.id,
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": f"Failed to deliver session to Saved Messages: {str(e)}"}
+
     async def handle_cancel(self, payload: dict) -> dict:
         if self.client:
             try:
@@ -199,6 +271,10 @@ async def main():
                 res = await worker.handle_export_session(payload)
             elif action == "validate_session":
                 res = await worker.handle_validate_session(payload)
+            elif action == "get_me":
+                res = await worker.handle_get_me(payload)
+            elif action == "send_to_saved_messages":
+                res = await worker.handle_send_to_saved_messages(payload)
             elif action == "cancel":
                 res = await worker.handle_cancel(payload)
                 res["id"] = req_id

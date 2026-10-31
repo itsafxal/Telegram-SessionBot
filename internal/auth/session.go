@@ -37,13 +37,14 @@ func FormatSessionMessage(providerName string, account *providers.AccountInfo, s
 
 Tap to copy. Store it securely and never share it with anyone.`,
 		providerName,
-		escapeMarkdown(userIdentifier),
+		EscapeMarkdown(userIdentifier),
 		SecurityWarning,
 		sessionString,
 	)
 }
 
-func escapeMarkdown(s string) string {
+// EscapeMarkdown escapes characters with special meaning in Telegram Markdown.
+func EscapeMarkdown(s string) string {
 	rep := strings.NewReplacer(
 		"_", "\\_",
 		"*", "\\*",

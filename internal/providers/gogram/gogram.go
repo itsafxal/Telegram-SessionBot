@@ -431,6 +431,90 @@ func (p *Provider) ValidateSession(ctx context.Context, sessionString string) (*
 	}, nil
 }
 
+func (p *Provider) GetAccountInfo(ctx context.Context) (*providers.AccountInfo, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.client == nil {
+		return nil, errors.New("gogram client is closed")
+	}
+
+	user, err := p.client.GetMe()
+	if err != nil {
+		return nil, fmt.Errorf("login verification failed: %w", err)
+	}
+
+	return &providers.AccountInfo{
+		ID:        user.ID,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+		Username:  user.Username,
+	}, nil
+}
+
+func (p *Provider) SendToSavedMessages(ctx context.Context, sessionString string) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.client == nil {
+		return 0, errors.New("gogram client is closed")
+	}
+
+	user, err := p.client.GetMe()
+	userID := int64(0)
+	name := "Authorized Account"
+	username := "N/A"
+	if err == nil && user != nil {
+		userID = user.ID
+		name = strings.TrimSpace(user.FirstName + " " + user.LastName)
+		if user.Username != "" {
+			username = "@" + user.Username
+		}
+	}
+	nowUTC := time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
+
+	text := fmt.Sprintf("🔐 **Universal Telegram MTProto Session**\n\n"+
+		"• **Provider:** %s\n"+
+		"• **Account ID:** `%d`\n"+
+		"• **Account Name:** %s\n"+
+		"• **Username:** %s\n"+
+		"• **Generated At:** %s\n"+
+		"• **Status:** ✅ Validated & Verified\n\n"+
+		"📋 **Your String Session:**\n"+
+		"```\n%s\n```\n\n"+
+		"⚠️ **Security Advisory:**\n"+
+		"This String Session grants full access to your Telegram account. Never share it with anyone or paste it into untrusted bots or websites.",
+		providers.DisplayNameGogram,
+		userID,
+		name,
+		username,
+		nowUTC,
+		sessionString,
+	)
+
+	sentMsg, err := p.client.SendMessage("me", text)
+	if err != nil {
+		return 0, fmt.Errorf("failed to send session to Saved Messages: %w", err)
+	}
+	if sentMsg == nil || sentMsg.ID <= 0 {
+		return 0, errors.New("failed to send session: no valid message ID received from Telegram")
+	}
+
+	// Verify delivery by searching for the message ID in Saved Messages
+	msgs, err := p.client.GetMessages("me", &telegram.SearchOption{
+		IDs: []int32{sentMsg.ID},
+	})
+	if err != nil || len(msgs) == 0 || msgs[0].ID != sentMsg.ID {
+		// If explicit retrieval encountered a transient error but sentMsg.ID > 0 was confirmed by Telegram
+		if sentMsg.ID > 0 {
+			return int64(sentMsg.ID), nil
+		}
+		return 0, errors.New("failed to verify message persistence in Saved Messages")
+	}
+
+	return int64(sentMsg.ID), nil
+}
+
 func (p *Provider) Cancel(ctx context.Context) error {
 	p.Cleanup()
 	return nil

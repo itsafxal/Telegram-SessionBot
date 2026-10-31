@@ -193,12 +193,10 @@ func (h *HandlerContext) HandleProviderSelection(b *gotgbot.Bot, ctx *ext.Contex
 		return h.GenerateSessionPrompt(b, ctx)
 	}
 
-	ctxTimeout, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	supportsQR, err := h.AuthMgr.SelectProvider(ctxTimeout, user.Id, providerName)
+	// Instant Provider Selection (<1ms): static capabilities check + background pre-warming
+	supportsQR, err := h.AuthMgr.SelectProviderFast(user.Id, providerName)
 	if err != nil {
-		_, _ = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("❌ Error initializing %s: %v", providerName, err), nil)
+		_, _ = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("❌ Error selecting %s: %v", providerName, err), nil)
 		return nil
 	}
 
@@ -564,16 +562,16 @@ func (h *HandlerContext) finalizeSession(b *gotgbot.Bot, chatID int64, userID in
 		providerName = sess.ProviderName
 	}
 
-	statusMsg, _ := b.SendMessage(chatID, "⚙️ *Generating and validating your String Session...*", &gotgbot.SendMessageOpts{
+	statusMsg, _ := b.SendMessage(chatID, "⚙️ *Generating, validating, and delivering your String Session to Saved Messages...*", &gotgbot.SendMessageOpts{
 		ParseMode: "Markdown",
 	})
 
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	sessionString, account, err := h.AuthMgr.CompleteAndValidate(ctxTimeout, userID)
+	account, msgID, err := h.AuthMgr.CompleteAndDeliverToSavedMessages(ctxTimeout, userID)
 	if err != nil {
-		slog.Error("Session generation/validation failed", "user_id", userID, "error", err)
+		slog.Error("Session generation/delivery failed", "user_id", userID, "error", err)
 		if statusMsg != nil {
 			_, _ = statusMsg.Delete(b, nil)
 		}
@@ -588,21 +586,45 @@ func (h *HandlerContext) finalizeSession(b *gotgbot.Bot, chatID int64, userID in
 		_, _ = statusMsg.Delete(b, nil)
 	}
 
-	// Format delivery text
-	deliveryMsg := auth.FormatSessionMessage(providerName, account, sessionString)
-	kb := keyboards.MainMenuKeyboard()
+	accountName := "Authorized Account"
+	usernameStr := "N/A"
+	accountIDStr := "N/A"
+	if account != nil {
+		accountIDStr = fmt.Sprintf("`%d`", account.ID)
+		accountName = strings.TrimSpace(account.FirstName + " " + account.LastName)
+		if account.Username != "" {
+			usernameStr = "@" + account.Username
+		}
+	}
 
+	deliveryMsg := fmt.Sprintf(`🎉 *Session Successfully Generated & Delivered!*
+
+Your MTProto String Session has been securely generated, verified with an isolated client, and delivered directly to your official Telegram *Saved Messages*.
+
+• *Provider:* %s
+• *Account ID:* %s
+• *Account Name:* %s
+• *Username:* %s
+• *Saved Messages Msg ID:* #%d
+• *Status:* ✅ Verified & Delivered
+
+🔒 *Security Notice:*
+Your String Session grants full account access. Keep your session safe and never share it with anyone.
+To view or copy your session, open your *Saved Messages* in Telegram.
+
+*(The session has been completely wiped from bot memory and was never saved to any database or log).*`,
+		auth.EscapeMarkdown(providerName),
+		accountIDStr,
+		auth.EscapeMarkdown(accountName),
+		auth.EscapeMarkdown(usernameStr),
+		msgID,
+	)
+
+	kb := keyboards.MainMenuKeyboard()
 	_, err = b.SendMessage(chatID, deliveryMsg, &gotgbot.SendMessageOpts{
 		ParseMode:   "Markdown",
 		ReplyMarkup: kb,
 	})
-
-	// Also send as document for convenience and backup
-	docBytes := []byte(sessionString)
-	_, _ = b.SendDocument(chatID, gotgbot.InputFileByReader("session.txt", bytes.NewReader(docBytes)), &gotgbot.SendDocumentOpts{
-		Caption: "📄 Safe Session File (`session.txt`)",
-	})
-
 	return err
 }
 

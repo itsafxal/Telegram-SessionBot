@@ -59,17 +59,20 @@ var validTransitions = map[State][]State{
 	},
 	StateAwaitingOTP: {
 		StateAwaitingTwoFactorPassword,
+		StateValidatingSession,
 		StateGeneratingSession,
 		StateFailed,
 		StateCancelled,
 	},
 	StateAwaitingTwoFactorPassword: {
+		StateValidatingSession,
 		StateGeneratingSession,
 		StateFailed,
 		StateCancelled,
 	},
 	StateAwaitingQRAuthentication: {
 		StateAwaitingTwoFactorPassword,
+		StateValidatingSession,
 		StateGeneratingSession,
 		StateFailed,
 		StateCancelled,
@@ -80,6 +83,7 @@ var validTransitions = map[State][]State{
 		StateCancelled,
 	},
 	StateValidatingSession: {
+		StateGeneratingSession,
 		StateDeliveringSession,
 		StateFailed,
 		StateCancelled,

@@ -277,6 +277,66 @@ func (p *Provider) ValidateSession(ctx context.Context, sessionString string) (*
 	}, nil
 }
 
+func (p *Provider) GetAccountInfo(ctx context.Context) (*providers.AccountInfo, error) {
+	p.mu.Lock()
+	worker := p.worker
+	p.mu.Unlock()
+
+	if worker == nil {
+		return nil, errors.New("provider worker is closed")
+	}
+
+	resp, err := worker.SendCommand(ctx, "get_me", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Status != "ok" {
+		return nil, fmt.Errorf("login verification failed: %s", resp.Error)
+	}
+
+	idVal, _ := resp.Data["id"].(float64)
+	firstName, _ := resp.Data["first_name"].(string)
+	lastName, _ := resp.Data["last_name"].(string)
+	username, _ := resp.Data["username"].(string)
+
+	return &providers.AccountInfo{
+		ID:        int64(idVal),
+		FirstName: firstName,
+		LastName:  lastName,
+		Username:  username,
+	}, nil
+}
+
+func (p *Provider) SendToSavedMessages(ctx context.Context, sessionString string) (int64, error) {
+	p.mu.Lock()
+	worker := p.worker
+	p.mu.Unlock()
+
+	if worker == nil {
+		return 0, errors.New("provider worker is closed")
+	}
+
+	resp, err := worker.SendCommand(ctx, "send_to_saved_messages", map[string]interface{}{
+		"session":       sessionString,
+		"provider_name": providers.DisplayNameTelethon,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	if resp.Status != "ok" {
+		return 0, fmt.Errorf("saved messages delivery failed: %s", resp.Error)
+	}
+
+	msgIDVal, _ := resp.Data["message_id"].(float64)
+	if msgIDVal <= 0 {
+		return 0, errors.New("invalid message ID returned from Saved Messages delivery")
+	}
+
+	return int64(msgIDVal), nil
+}
+
 func (p *Provider) Cancel(ctx context.Context) error {
 	p.Cleanup()
 	return nil

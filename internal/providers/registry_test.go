@@ -27,6 +27,12 @@ func (d *dummyProvider) ExportSession(ctx context.Context) (string, error) { ret
 func (d *dummyProvider) ValidateSession(ctx context.Context, s string) (*AccountInfo, error) {
 	return nil, nil
 }
+func (d *dummyProvider) GetAccountInfo(ctx context.Context) (*AccountInfo, error) {
+	return &AccountInfo{ID: 12345678, FirstName: "Test", Username: "testuser"}, nil
+}
+func (d *dummyProvider) SendToSavedMessages(ctx context.Context, s string) (int64, error) {
+	return 999, nil
+}
 func (d *dummyProvider) Cancel(ctx context.Context) error { return nil }
 func (d *dummyProvider) Cleanup()                         {}
 

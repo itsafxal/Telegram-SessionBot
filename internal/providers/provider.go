@@ -73,6 +73,12 @@ type Provider interface {
 	// ValidateSession creates a fresh isolated client to verify account authorization
 	ValidateSession(ctx context.Context, sessionString string) (*AccountInfo, error)
 
+	// GetAccountInfo verifies that MTProto authorization succeeded and returns authenticated account identity
+	GetAccountInfo(ctx context.Context) (*AccountInfo, error)
+
+	// SendToSavedMessages sends the generated session string to the account's own Saved Messages and verifies delivery
+	SendToSavedMessages(ctx context.Context, sessionString string) (int64, error)
+
 	// Cancel stops any in-progress authentication
 	Cancel(ctx context.Context) error
 
