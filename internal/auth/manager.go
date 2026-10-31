@@ -54,6 +54,13 @@ func (m *Manager) GetSession(userID int64) *UserSession {
 	return m.store.Get(userID)
 }
 
+// ActiveSessionsCount returns the number of currently active or initializing authentication sessions.
+func (m *Manager) ActiveSessionsCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.activeProviders) + len(m.pendingInits)
+}
+
 // StartSession initiates provider selection for a user.
 func (m *Manager) StartSession(userID int64) error {
 	m.Cleanup(userID)

@@ -188,7 +188,11 @@ func (m *Manager) ExecuteBroadcast(ctx context.Context, b *gotgbot.Bot, updatePr
 					if tgErr.Code == 429 && tgErr.ResponseParams != nil && tgErr.ResponseParams.RetryAfter > 0 {
 						sleepDur := time.Duration(tgErr.ResponseParams.RetryAfter+1) * time.Second
 						slog.Warn("Broadcast hit FloodWait, sleeping", "seconds", tgErr.ResponseParams.RetryAfter)
-						time.Sleep(sleepDur)
+						select {
+						case <-broadcastCtx.Done():
+							return
+						case <-time.After(sleepDur):
+						}
 						// Retry once
 						_, err = b.CopyMessage(targetID, pending.FromChatID, pending.MessageID, nil)
 					}
@@ -203,7 +207,11 @@ func (m *Manager) ExecuteBroadcast(ctx context.Context, b *gotgbot.Bot, updatePr
 			}
 
 			// Telegram broadcast rate limit: ~30 msgs/second
-			time.Sleep(35 * time.Millisecond)
+			select {
+			case <-broadcastCtx.Done():
+				return
+			case <-time.After(35 * time.Millisecond):
+			}
 
 			// Progress reporting every 3 seconds or every 50 users
 			if time.Since(lastProgressUpdate) > 3*time.Second || (i+1)%50 == 0 {

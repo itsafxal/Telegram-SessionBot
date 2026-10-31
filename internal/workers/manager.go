@@ -97,6 +97,10 @@ func StartWorker(ctx context.Context, pythonPath, scriptPath, workerType string,
 // readStdoutLoop reads JSON responses from the worker stdout and routes them to waiting callers.
 func (w *WorkerProcess) readStdoutLoop(r io.Reader) {
 	scanner := bufio.NewScanner(r)
+	// Allow up to 2MB tokens so large string sessions and tracebacks never abort scanning
+	scannerBuf := make([]byte, 64*1024)
+	scanner.Buffer(scannerBuf, 2*1024*1024)
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -121,6 +125,10 @@ func (w *WorkerProcess) readStdoutLoop(r io.Reader) {
 		}
 	}
 
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+		slog.Warn(fmt.Sprintf("[%s worker] Stdout scanner error", w.workerType), "error", err)
+	}
+
 	// Mark closed and notify all waiting callers that worker exited
 	w.closed.Store(true)
 	w.pendingMu.Lock()
@@ -129,6 +137,17 @@ func (w *WorkerProcess) readStdoutLoop(r io.Reader) {
 		delete(w.pending, id)
 	}
 	w.pendingMu.Unlock()
+}
+
+// IsAlive returns true if the worker process is running and not marked closed.
+func (w *WorkerProcess) IsAlive() bool {
+	if w == nil || w.closed.Load() {
+		return false
+	}
+	if w.cmd == nil || w.cmd.Process == nil {
+		return false
+	}
+	return true
 }
 
 // SendCommand sends a structured JSON request to the worker and waits for its corresponding response.
@@ -181,10 +200,13 @@ func (w *WorkerProcess) SendCommand(ctx context.Context, action string, payload 
 		}
 	}
 
+	timer := time.NewTimer(cmdTimeout)
+	defer timer.Stop()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-time.After(cmdTimeout):
+	case <-timer.C:
 		return nil, fmt.Errorf("worker command '%s' timed out after %v", action, cmdTimeout)
 	case resp, ok := <-respChan:
 		if !ok || resp == nil {
@@ -237,6 +259,9 @@ func (w *WorkerProcess) Close() error {
 // streamStderr reads stderr lines and forwards them to slog with credential redaction.
 func (w *WorkerProcess) streamStderr() {
 	scanner := bufio.NewScanner(w.stderr)
+	errBuf := make([]byte, 16*1024)
+	scanner.Buffer(errBuf, 1024*1024)
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		sanitized := security.SanitizeLogText(line)
