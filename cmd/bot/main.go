@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -57,11 +59,44 @@ func main() {
 		_ = db.Close(closeCtx)
 	}()
 
-	// 4. Log registered MTProto providers
+	// 4. Start HTTP health check server (required for Render Web Service compatibility)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok","service":"Universal Telegram MTProto Session Generator"}`))
+	})
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	httpServer := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  15 * time.Second,
+	}
+
+	go func() {
+		slog.Info("Health check HTTP server listening", "port", cfg.Port)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("HTTP health check server error", "error", err)
+		}
+	}()
+
+	// 5. Log registered MTProto providers
 	registeredProviders := providers.List()
 	slog.Info("Registered MTProto providers", "providers", registeredProviders)
 
-	// 5. Initialize managers and security modules
+	// 6. Initialize managers and security modules
 	rateLimiter := security.NewRateLimiter(20, time.Minute)
 	authMgr := auth.NewManager(cfg)
 	broadcastMgr := broadcast.NewManager(cfg.OwnerID, db)
@@ -73,7 +108,7 @@ func main() {
 		RateLimiter:  rateLimiter,
 	}
 
-	// 6. Initialize Telegram Bot
+	// 7. Initialize Telegram Bot
 	bot, err := gotgbot.NewBot(cfg.BotToken, nil)
 	if err != nil {
 		slog.Error("Failed to initialize Telegram bot instance", "error", err)
@@ -82,12 +117,24 @@ func main() {
 
 	slog.Info("Telegram bot initialized successfully", "username", bot.Username, "id", bot.Id)
 
-	// 7. Setup router and dispatcher
+	// Explicitly clear existing webhook and pending updates to prevent duplicate polling conflicts
+	delWebhookOpts := &gotgbot.DeleteWebhookOpts{DropPendingUpdates: true}
+	if _, delErr := bot.DeleteWebhook(delWebhookOpts); delErr != nil {
+		slog.Warn("Failed to explicitly delete webhook before polling (proceeding anyway)", "error", delErr)
+	}
+
+	// 8. Setup router and dispatcher
 	_, updater := router.SetupRouter(handlerCtx)
 
-	// 8. Start long-polling for updates
+	// Custom error handler for polling issues to gracefully log warnings without fatal crashing
+	updater.UnhandledErrFunc = func(err error) {
+		slog.Warn("Telegram updater warning", "error", err)
+	}
+
+	// 9. Start long-polling for updates
 	pollOpts := &ext.PollingOpts{
-		DropPendingUpdates: true,
+		DropPendingUpdates:    true,
+		EnableWebhookDeletion: true,
 		GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
 			Timeout: 30,
 			RequestOpts: &gotgbot.RequestOpts{
@@ -104,7 +151,7 @@ func main() {
 
 	slog.Info("Bot long-polling started. Listening for updates...")
 
-	// 9. Graceful shutdown handler for SIGINT and SIGTERM
+	// 10. Graceful shutdown handler for SIGINT and SIGTERM
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
@@ -117,6 +164,15 @@ func main() {
 		slog.Warn("Error while stopping updater", "error", stopErr)
 	} else {
 		slog.Info("Updater stopped successfully")
+	}
+
+	// Graceful shutdown for HTTP health server
+	httpShutdownCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer httpCancel()
+	if err := httpServer.Shutdown(httpShutdownCtx); err != nil {
+		slog.Warn("Error shutting down HTTP server", "error", err)
+	} else {
+		slog.Info("HTTP server stopped successfully")
 	}
 
 	slog.Info("Antigravity Session Generator terminated cleanly")

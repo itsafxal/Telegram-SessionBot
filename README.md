@@ -220,7 +220,9 @@ The application features a production-ready, multi-stage Dockerfile that builds 
 
 ## Deploying on Render
 
-Render is the primary production target. The bot runs continuously as a **Render Background Worker** using **Docker runtime** and Telegram **long polling**.
+Render is the primary production target. The bot supports both **Render Web Service** (including the **Free tier**) and **Render Background Worker** using **Docker runtime** and Telegram **long polling**.
+
+The application includes an internal HTTP health check server that listens on `$PORT` (default `:10000` or `:8080`) providing `/healthz` and `/` endpoints. This ensures Render's port-scanning probes pass immediately, preventing port scan timeouts.
 
 ### Step-by-Step Blueprint Deployment
 
@@ -229,9 +231,10 @@ Render is the primary production target. The bot runs continuously as a **Render
 3. Click **New +** and select **Blueprint**.
 4. Connect your GitHub repository.
 5. Render will automatically detect and parse [`render.yaml`](render.yaml):
-   - Service Type: `Background Worker`
+   - Service Type: `Web Service`
    - Runtime: `Docker`
-   - Plan: `Starter`
+   - Plan: `Free`
+   - Health Check Path: `/healthz`
 6. Under **Environment Variables**, fill in your secret credentials:
    - `BOT_TOKEN`: Your token from @BotFather.
    - `API_ID`: Your API ID from my.telegram.org.
@@ -240,20 +243,33 @@ Render is the primary production target. The bot runs continuously as a **Render
    - `MONGODB_DATABASE`: (e.g. `telegram_session_bot`).
    - `OWNER_ID`: Your Telegram numeric User ID.
 7. Click **Apply Blueprint**.
-8. Wait for Render to build the multi-stage Docker container and deploy the Background Worker.
+8. Wait for Render to build the multi-stage Docker container and deploy the service.
 9. Open the **Logs** tab in Render:
+   - Verify: `Health check HTTP server listening port=10000`
    - Verify: `MongoDB unique index on user_id verified`
    - Verify: `Bot long-polling started. Listening for updates...`
 10. Open Telegram, open your bot, and send `/start`.
+
+### Deploying Manually via Render Dashboard
+
+If you prefer deploying manually without Blueprints:
+1. Click **New +** > **Web Service**.
+2. Connect your GitHub repository.
+3. Select **Docker** as the Environment / Runtime.
+4. Set **Health Check Path** to `/healthz`.
+5. Under **Environment Variables**, add:
+   - `BOT_TOKEN`, `API_ID`, `API_HASH`, `MONGODB_URI`, `MONGODB_DATABASE`, `OWNER_ID`
+   - `PORT`: `10000`
+6. Click **Create Web Service**.
 
 ### Updating After GitHub Pushes
 - With `autoDeploy: true` configured in `render.yaml`, any push to your connected branch automatically triggers a zero-downtime rebuild and restart.
 - Alternatively, click **Manual Deploy > Clear build cache & deploy** in the Render Dashboard.
 
 ### Diagnosing Common Issues on Render
-- **Build Errors:** If pip installation or Go compilation fails, check the **Build Logs** in Render. Multi-stage caching ensures dependencies are only re-downloaded when files change.
-- **MongoDB Connection Timeout:** Ensure your MongoDB Atlas Network Access whitelist allows connections from all IPs (`0.0.0.0/0`), as Render workers use dynamic egress IPs.
-- **Duplicate Polling Conflicts:** Ensure only **one** instance of the Background Worker is running. Running multiple worker instances with long-polling will cause Telegram `409 Conflict: terminated by other getUpdates request`.
+- **Port Scan Timeout:** The Go server automatically binds to `$PORT` and exposes `/healthz` and `/` endpoints. Ensure the Health Check Path is set to `/healthz` or `/`.
+- **Telegram 409 Conflict:** Telegram allows only one polling instance per bot token. The bot automatically deletes stale webhooks and clears pending updates on boot. When redeploying on Render, the port health check ensures rapid container handover so previous instances are promptly shut down.
+- **MongoDB Connection Timeout:** Ensure your MongoDB Atlas Network Access whitelist allows connections from all IPs (`0.0.0.0/0`), as Render containers use dynamic egress IPs.
 - **Worker Process Failures:** Stderr output from Python workers is streamed directly to Render logs with sensitive values redacted.
 
 ---

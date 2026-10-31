@@ -24,12 +24,16 @@ func TestConfigValid(t *testing.T) {
 	os.Setenv("MONGODB_DATABASE", "test_db")
 	os.Setenv("OWNER_ID", "99887766")
 	os.Setenv("LOG_LEVEL", "DEBUG")
+	os.Setenv("PORT", "9000")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("unexpected error loading valid config: %v", err)
 	}
 
+	if cfg.Port != "9000" {
+		t.Errorf("expected Port 9000, got %s", cfg.Port)
+	}
 	if cfg.APIID != 123456 {
 		t.Errorf("expected APIID 123456, got %d", cfg.APIID)
 	}

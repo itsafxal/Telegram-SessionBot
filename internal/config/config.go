@@ -20,6 +20,7 @@ type Config struct {
 	MongoDBDatabase       string
 	OwnerID               int64
 	PythonPath            string
+	Port                  string
 	WorkerTimeout         time.Duration
 	MaxConcurrentAuth     int
 	LogLevel              string
@@ -74,6 +75,11 @@ func Load() (*Config, error) {
 		pythonPath = detectPythonPath()
 	}
 
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "8080"
+	}
+
 	workerTimeoutSec := 300
 	if secStr := strings.TrimSpace(os.Getenv("WORKER_TIMEOUT_SECONDS")); secStr != "" {
 		if sec, err := strconv.Atoi(secStr); err == nil && sec > 0 {
@@ -101,6 +107,7 @@ func Load() (*Config, error) {
 		MongoDBDatabase:       mongoDB,
 		OwnerID:               ownerID,
 		PythonPath:            pythonPath,
+		Port:                  port,
 		WorkerTimeout:         time.Duration(workerTimeoutSec) * time.Second,
 		MaxConcurrentAuth:     maxAuth,
 		LogLevel:              logLevel,
@@ -125,6 +132,6 @@ func (c *Config) SafeString() string {
 	if len(c.BotToken) > 8 {
 		maskedToken = c.BotToken[:4] + "..." + c.BotToken[len(c.BotToken)-4:]
 	}
-	return fmt.Sprintf("Config{BotToken: %s, APIID: %d, MongoDBDatabase: %s, OwnerID: %d, PythonPath: %s, WorkerTimeout: %v, MaxConcurrentAuth: %d, LogLevel: %s}",
-		maskedToken, c.APIID, c.MongoDBDatabase, c.OwnerID, c.PythonPath, c.WorkerTimeout, c.MaxConcurrentAuth, c.LogLevel)
+	return fmt.Sprintf("Config{BotToken: %s, APIID: %d, MongoDBDatabase: %s, OwnerID: %d, PythonPath: %s, Port: %s, WorkerTimeout: %v, MaxConcurrentAuth: %d, LogLevel: %s}",
+		maskedToken, c.APIID, c.MongoDBDatabase, c.OwnerID, c.PythonPath, c.Port, c.WorkerTimeout, c.MaxConcurrentAuth, c.LogLevel)
 }

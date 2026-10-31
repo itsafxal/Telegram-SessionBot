@@ -63,5 +63,8 @@ RUN groupadd -g 10001 appgroup && \
 
 USER appuser
 
+# Expose ports for HTTP health check (Render Web Service / Container probes)
+EXPOSE 8080 10000
+
 # Use exec form ENTRYPOINT for clean SIGTERM signal propagation
 ENTRYPOINT ["/app/bot"]

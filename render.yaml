@@ -1,10 +1,11 @@
 services:
-  - type: worker
+  - type: web
     name: universal-session-generator
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    plan: starter
+    plan: free
+    healthCheckPath: /healthz
     numInstances: 1
     autoDeploy: true
     envVars:
@@ -22,4 +23,5 @@ services:
         sync: false
       - key: LOG_LEVEL
         value: INFO
-
+      - key: PORT
+        value: 10000
