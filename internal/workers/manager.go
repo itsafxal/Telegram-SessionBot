@@ -20,6 +20,7 @@ import (
 // WorkerProcess manages a single isolated Python MTProto worker process.
 type WorkerProcess struct {
 	cmd        *exec.Cmd
+	cancelFn   context.CancelFunc
 	stdin      io.WriteCloser
 	stderr     io.ReadCloser
 	writeMu    sync.Mutex
@@ -33,27 +34,41 @@ type WorkerProcess struct {
 
 // StartWorker launches a new Python worker process and starts listening on its stdout/stderr.
 func StartWorker(ctx context.Context, pythonPath, scriptPath, workerType string, timeout time.Duration) (*WorkerProcess, error) {
-	cmd := exec.CommandContext(ctx, pythonPath, "-u", scriptPath)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// A worker process is a stateful subprocess that persists across multiple interactive
+	// Telegram message rounds (provider selection -> phone number -> OTP -> 2FA).
+	// Its lifetime must NOT be bound to the caller's transient request context, which is canceled
+	// as soon as the HTTP/bot handler returns. Instead, we give it its own dedicated cancelable
+	// lifecycle context that is terminated only when worker.Close() is called.
+	procCtx, procCancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(procCtx, pythonPath, "-u", scriptPath)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		procCancel()
 		return nil, fmt.Errorf("failed to create stdin pipe for %s worker: %w", workerType, err)
 	}
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
+		procCancel()
 		_ = stdin.Close()
 		return nil, fmt.Errorf("failed to create stdout pipe for %s worker: %w", workerType, err)
 	}
 
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
+		procCancel()
 		_ = stdin.Close()
 		_ = stdoutPipe.Close()
 		return nil, fmt.Errorf("failed to create stderr pipe for %s worker: %w", workerType, err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		procCancel()
 		_ = stdin.Close()
 		_ = stdoutPipe.Close()
 		_ = stderrPipe.Close()
@@ -62,6 +77,7 @@ func StartWorker(ctx context.Context, pythonPath, scriptPath, workerType string,
 
 	worker := &WorkerProcess{
 		cmd:        cmd,
+		cancelFn:   procCancel,
 		stdin:      stdin,
 		stderr:     stderrPipe,
 		pending:    make(map[string]chan *Response),
@@ -204,8 +220,15 @@ func (w *WorkerProcess) Close() error {
 		if w.cmd.Process != nil {
 			_ = w.cmd.Process.Kill()
 		}
+		if w.cancelFn != nil {
+			w.cancelFn()
+		}
 		<-done
 	case <-done:
+	}
+
+	if w.cancelFn != nil {
+		w.cancelFn()
 	}
 
 	return nil
