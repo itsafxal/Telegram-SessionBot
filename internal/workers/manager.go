@@ -1,0 +1,222 @@
+package workers
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os/exec"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"universal-session-generator/internal/security"
+)
+
+// WorkerProcess manages a single isolated Python MTProto worker process.
+type WorkerProcess struct {
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stderr     io.ReadCloser
+	writeMu    sync.Mutex
+	pendingMu  sync.Mutex
+	pending    map[string]chan *Response
+	reqSeq     int64
+	timeout    time.Duration
+	closed     atomic.Bool
+	workerType string
+}
+
+// StartWorker launches a new Python worker process and starts listening on its stdout/stderr.
+func StartWorker(ctx context.Context, pythonPath, scriptPath, workerType string, timeout time.Duration) (*WorkerProcess, error) {
+	cmd := exec.CommandContext(ctx, pythonPath, "-u", scriptPath)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdin pipe for %s worker: %w", workerType, err)
+	}
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, fmt.Errorf("failed to create stdout pipe for %s worker: %w", workerType, err)
+	}
+
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		_ = stdoutPipe.Close()
+		return nil, fmt.Errorf("failed to create stderr pipe for %s worker: %w", workerType, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdoutPipe.Close()
+		_ = stderrPipe.Close()
+		return nil, fmt.Errorf("failed to start %s worker process: %w", workerType, err)
+	}
+
+	worker := &WorkerProcess{
+		cmd:        cmd,
+		stdin:      stdin,
+		stderr:     stderrPipe,
+		pending:    make(map[string]chan *Response),
+		timeout:    timeout,
+		workerType: workerType,
+	}
+
+	// Dedicated background goroutine reading stdout continuously
+	go worker.readStdoutLoop(stdoutPipe)
+
+	// Stream worker stderr to slog with redaction
+	go worker.streamStderr()
+
+	return worker, nil
+}
+
+// readStdoutLoop reads JSON responses from the worker stdout and routes them to waiting callers.
+func (w *WorkerProcess) readStdoutLoop(r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var resp Response
+		if err := json.Unmarshal(line, &resp); err != nil {
+			slog.Debug(fmt.Sprintf("[%s worker] Non-JSON stdout: %s", w.workerType, security.SanitizeLogText(string(line))))
+			continue
+		}
+
+		w.pendingMu.Lock()
+		ch, exists := w.pending[resp.ID]
+		w.pendingMu.Unlock()
+
+		if exists && ch != nil {
+			select {
+			case ch <- &resp:
+			default:
+			}
+		}
+	}
+
+	// Mark closed and notify all waiting callers that worker exited
+	w.closed.Store(true)
+	w.pendingMu.Lock()
+	for id, ch := range w.pending {
+		close(ch)
+		delete(w.pending, id)
+	}
+	w.pendingMu.Unlock()
+}
+
+// SendCommand sends a structured JSON request to the worker and waits for its corresponding response.
+func (w *WorkerProcess) SendCommand(ctx context.Context, action string, payload map[string]interface{}) (*Response, error) {
+	if w.closed.Load() {
+		return nil, errors.New("worker process is already closed")
+	}
+
+	reqID := fmt.Sprintf("req-%d", atomic.AddInt64(&w.reqSeq, 1))
+	req := Request{
+		ID:      reqID,
+		Action:  action,
+		Payload: payload,
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize worker request: %w", err)
+	}
+
+	respChan := make(chan *Response, 1)
+
+	w.pendingMu.Lock()
+	w.pending[reqID] = respChan
+	w.pendingMu.Unlock()
+
+	defer func() {
+		w.pendingMu.Lock()
+		delete(w.pending, reqID)
+		w.pendingMu.Unlock()
+	}()
+
+	w.writeMu.Lock()
+	if w.closed.Load() {
+		w.writeMu.Unlock()
+		return nil, errors.New("worker process closed before send")
+	}
+	_, err = fmt.Fprintf(w.stdin, "%s\n", data)
+	w.writeMu.Unlock()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to write to worker stdin: %w", err)
+	}
+
+	cmdTimeout := w.timeout
+	if dl, ok := ctx.Deadline(); ok {
+		remaining := time.Until(dl)
+		if remaining < cmdTimeout && remaining > 0 {
+			cmdTimeout = remaining
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(cmdTimeout):
+		return nil, fmt.Errorf("worker command '%s' timed out after %v", action, cmdTimeout)
+	case resp, ok := <-respChan:
+		if !ok || resp == nil {
+			return nil, errors.New("worker process terminated or closed stdout unexpectedly")
+		}
+		return resp, nil
+	}
+}
+
+// Close gracefully terminates the worker process and frees all pipes.
+func (w *WorkerProcess) Close() error {
+	if w.closed.Swap(true) {
+		return nil
+	}
+
+	w.writeMu.Lock()
+	// Send cancel action before exiting
+	cancelReq, _ := json.Marshal(Request{
+		ID:     "exit",
+		Action: "cancel",
+	})
+	_, _ = fmt.Fprintf(w.stdin, "%s\n", cancelReq)
+	_ = w.stdin.Close()
+	w.writeMu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- w.cmd.Wait()
+	}()
+
+	select {
+	case <-time.After(2 * time.Second):
+		if w.cmd.Process != nil {
+			_ = w.cmd.Process.Kill()
+		}
+		<-done
+	case <-done:
+	}
+
+	return nil
+}
+
+// streamStderr reads stderr lines and forwards them to slog with credential redaction.
+func (w *WorkerProcess) streamStderr() {
+	scanner := bufio.NewScanner(w.stderr)
+	for scanner.Scan() {
+		line := scanner.Text()
+		sanitized := security.SanitizeLogText(line)
+		slog.Debug(fmt.Sprintf("[%s worker] %s", w.workerType, sanitized))
+	}
+}
