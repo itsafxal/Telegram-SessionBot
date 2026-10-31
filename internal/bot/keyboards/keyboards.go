@@ -4,7 +4,7 @@ import (
 	"github.com/PaulSonOfLars/gotgbot/v2"
 )
 
-// MainMenuKeyboard returns the primary ReplyKeyboardMarkup for the bot.
+// MainMenuKeyboard returns the primary ReplyKeyboardMarkup for the bot with only the 4 required buttons.
 func MainMenuKeyboard() gotgbot.ReplyKeyboardMarkup {
 	return gotgbot.ReplyKeyboardMarkup{
 		Keyboard: [][]gotgbot.KeyboardButton{
@@ -12,11 +12,11 @@ func MainMenuKeyboard() gotgbot.ReplyKeyboardMarkup {
 				{Text: "🚀 Generate Session"},
 			},
 			{
-				{Text: "ℹ️ Help"},
 				{Text: "📖 About"},
+				{Text: "ℹ️ Help"},
 			},
 			{
-				{Text: "❌ Cancel"},
+				{Text: "🛑 Abort"},
 			},
 		},
 		ResizeKeyboard: true,
@@ -36,7 +36,7 @@ func ProviderSelectionKeyboard() gotgbot.ReplyKeyboardMarkup {
 			},
 			{
 				{Text: "⬅️ Back"},
-				{Text: "❌ Cancel"},
+				{Text: "🛑 Abort"},
 			},
 		},
 		ResizeKeyboard: true,
@@ -55,7 +55,7 @@ func AuthMethodKeyboard(supportsQR bool) gotgbot.ReplyKeyboardMarkup {
 	}
 	rows = append(rows, []gotgbot.KeyboardButton{
 		{Text: "⬅️ Back"},
-		{Text: "❌ Cancel"},
+		{Text: "🛑 Abort"},
 	})
 
 	return gotgbot.ReplyKeyboardMarkup{
@@ -64,16 +64,21 @@ func AuthMethodKeyboard(supportsQR bool) gotgbot.ReplyKeyboardMarkup {
 	}
 }
 
-// CancelOnlyKeyboard returns a keyboard with only the Cancel option during input steps.
-func CancelOnlyKeyboard() gotgbot.ReplyKeyboardMarkup {
+// AbortOnlyKeyboard returns a keyboard with only the Abort option during active authentication steps.
+func AbortOnlyKeyboard() gotgbot.ReplyKeyboardMarkup {
 	return gotgbot.ReplyKeyboardMarkup{
 		Keyboard: [][]gotgbot.KeyboardButton{
 			{
-				{Text: "❌ Cancel"},
+				{Text: "🛑 Abort"},
 			},
 		},
 		ResizeKeyboard: true,
 	}
+}
+
+// CancelOnlyKeyboard is an alias for AbortOnlyKeyboard for backward compatibility.
+func CancelOnlyKeyboard() gotgbot.ReplyKeyboardMarkup {
+	return AbortOnlyKeyboard()
 }
 
 // BroadcastConfirmationKeyboard returns confirmation keyboard for broadcasting.
@@ -82,7 +87,7 @@ func BroadcastConfirmationKeyboard() gotgbot.ReplyKeyboardMarkup {
 		Keyboard: [][]gotgbot.KeyboardButton{
 			{
 				{Text: "✅ Confirm Broadcast"},
-				{Text: "❌ Cancel Broadcast"},
+				{Text: "🛑 Abort"},
 			},
 		},
 		ResizeKeyboard: true,

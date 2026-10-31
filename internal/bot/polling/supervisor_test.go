@@ -129,3 +129,4 @@ func TestDuplicateStartPrevention(t *testing.T) {
 		t.Fatalf("expected error on duplicate Start(), got nil")
 	}
 }
+

@@ -129,8 +129,8 @@ No credentials, passwords, OTPs, or session strings are ever permanently stored 
 	return err
 }
 
-// CancelHandler handles /cancel and cancel button presses.
-func (h *HandlerContext) CancelHandler(b *gotgbot.Bot, ctx *ext.Context) error {
+// AbortHandler handles /abort (and /cancel) and abort button presses.
+func (h *HandlerContext) AbortHandler(b *gotgbot.Bot, ctx *ext.Context) error {
 	user := ctx.EffectiveSender.User
 	if user == nil {
 		return nil
@@ -140,10 +140,15 @@ func (h *HandlerContext) CancelHandler(b *gotgbot.Bot, ctx *ext.Context) error {
 	_ = h.BroadcastMgr.Cancel(user.Id)
 
 	kb := keyboards.MainMenuKeyboard()
-	_, err := b.SendMessage(ctx.EffectiveChat.Id, "❌ Current operation cancelled. All temporary session memory and workers have been wiped.", &gotgbot.SendMessageOpts{
+	_, err := b.SendMessage(ctx.EffectiveChat.Id, "🛑 Operation aborted. All temporary session memory and workers have been wiped.", &gotgbot.SendMessageOpts{
 		ReplyMarkup: kb,
 	})
 	return err
+}
+
+// CancelHandler maintains backward compatibility by delegating to AbortHandler.
+func (h *HandlerContext) CancelHandler(b *gotgbot.Bot, ctx *ext.Context) error {
+	return h.AbortHandler(b, ctx)
 }
 
 // GenerateSessionPrompt starts provider selection.
@@ -222,7 +227,7 @@ How would you like to log in?`, displayName)
 Please send your Telegram phone number with international country code (e.g. `+"`+1234567890`"+`).
 
 *(QR Code is not supported by %s; phone authentication will be used).*`, displayName, displayName)
-	kb := keyboards.CancelOnlyKeyboard()
+	kb := keyboards.AbortOnlyKeyboard()
 	_, err = b.SendMessage(ctx.EffectiveChat.Id, prompt, &gotgbot.SendMessageOpts{
 		ParseMode:   "Markdown",
 		ReplyMarkup: kb,
@@ -248,7 +253,7 @@ func (h *HandlerContext) HandleAuthMethodSelection(b *gotgbot.Bot, ctx *ext.Cont
 	}
 
 	// Awaiting phone number
-	kb := keyboards.CancelOnlyKeyboard()
+	kb := keyboards.AbortOnlyKeyboard()
 	_, err = b.SendMessage(ctx.EffectiveChat.Id, "📱 Please send your Telegram phone number with international country code (e.g. `+1234567890`):", &gotgbot.SendMessageOpts{
 		ParseMode:   "Markdown",
 		ReplyMarkup: kb,
@@ -279,7 +284,7 @@ func (h *HandlerContext) triggerQRAuth(b *gotgbot.Bot, ctx *ext.Context, userID 
 
 ⏳ *Waiting for your authorization...*`
 
-	kb := keyboards.CancelOnlyKeyboard()
+	kb := keyboards.AbortOnlyKeyboard()
 	_, err = b.SendPhoto(ctx.EffectiveChat.Id, gotgbot.InputFileByReader("qr.png", bytes.NewReader(pngBytes)), &gotgbot.SendPhotoOpts{
 		Caption:     caption,
 		ParseMode:   "Markdown",
@@ -320,7 +325,7 @@ func (h *HandlerContext) triggerQRAuth(b *gotgbot.Bot, ctx *ext.Context, userID 
 		if waitRes.Status == "need_password" {
 			_, _ = b.SendMessage(ctx.EffectiveChat.Id, "🔐 *Two-Step Verification (2FA) is enabled on your account.*\n\nPlease send your cloud password below:", &gotgbot.SendMessageOpts{
 				ParseMode:   "Markdown",
-				ReplyMarkup: keyboards.CancelOnlyKeyboard(),
+				ReplyMarkup: keyboards.AbortOnlyKeyboard(),
 			})
 			return
 		}
@@ -395,6 +400,11 @@ func (h *HandlerContext) HandleTextMessage(b *gotgbot.Bot, ctx *ext.Context) err
 		}
 	}
 
+	// Check if user pressed Abort or Cancel at any point during active operations
+	if isAbortButton(text) {
+		return h.AbortHandler(b, ctx)
+	}
+
 	// Check user auth state
 	sess := h.AuthMgr.GetSession(user.Id)
 	if sess == nil {
@@ -448,16 +458,16 @@ func (h *HandlerContext) handleMenuButtons(b *gotgbot.Bot, ctx *ext.Context, tex
 	switch {
 	case strings.Contains(lower, "generate") || strings.Contains(lower, "🚀"):
 		return h.GenerateSessionPrompt(b, ctx)
-	case strings.Contains(lower, "help") || strings.Contains(lower, "ℹ️"):
-		return h.HelpHandler(b, ctx)
 	case strings.Contains(lower, "about") || strings.Contains(lower, "📖"):
 		return h.AboutHandler(b, ctx)
-	case strings.Contains(lower, "cancel") || strings.Contains(lower, "❌"):
-		return h.CancelHandler(b, ctx)
+	case strings.Contains(lower, "help") || strings.Contains(lower, "ℹ️"):
+		return h.HelpHandler(b, ctx)
+	case isAbortButton(text):
+		return h.AbortHandler(b, ctx)
 	case strings.Contains(lower, "confirm broadcast") || strings.Contains(lower, "✅"):
 		return h.HandleConfirmBroadcast(b, ctx)
 	case strings.Contains(lower, "cancel broadcast"):
-		return h.CancelHandler(b, ctx)
+		return h.AbortHandler(b, ctx)
 	default:
 		return nil
 	}
@@ -472,14 +482,14 @@ func (h *HandlerContext) handlePhoneNumberInput(b *gotgbot.Bot, ctx *ext.Context
 	res, err := h.AuthMgr.StartPhoneAuth(ctxTimeout, userID, phoneInput)
 	if err != nil {
 		_, _ = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("❌ Error: %v", err), &gotgbot.SendMessageOpts{
-			ReplyMarkup: keyboards.CancelOnlyKeyboard(),
+			ReplyMarkup: keyboards.AbortOnlyKeyboard(),
 		})
 		return nil
 	}
 
 	if res.Status == "error" {
 		_, _ = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("❌ %s", res.ErrorMessage), &gotgbot.SendMessageOpts{
-			ReplyMarkup: keyboards.CancelOnlyKeyboard(),
+			ReplyMarkup: keyboards.AbortOnlyKeyboard(),
 		})
 		return nil
 	}
@@ -491,7 +501,7 @@ Check your official Telegram app messages (or SMS).
 
 *Tip:* Format like ` + "`12345` or `1 2 3 4 5`" + `.`
 
-	kb := keyboards.CancelOnlyKeyboard()
+	kb := keyboards.AbortOnlyKeyboard()
 	_, err = b.SendMessage(ctx.EffectiveChat.Id, prompt, &gotgbot.SendMessageOpts{
 		ParseMode:   "Markdown",
 		ReplyMarkup: kb,
@@ -524,7 +534,7 @@ Your Telegram account is protected by a 2FA cloud password.
 Please enter your 2FA password to complete authentication:
 
 *(Your password will NEVER be saved or logged).*`
-		kb := keyboards.CancelOnlyKeyboard()
+		kb := keyboards.AbortOnlyKeyboard()
 		_, err := b.SendMessage(ctx.EffectiveChat.Id, prompt, &gotgbot.SendMessageOpts{
 			ParseMode:   "Markdown",
 			ReplyMarkup: kb,
@@ -641,7 +651,7 @@ func (h *HandlerContext) BroadcastHandler(b *gotgbot.Bot, ctx *ext.Context) erro
 		return err
 	}
 
-	kb := keyboards.CancelOnlyKeyboard()
+	kb := keyboards.AbortOnlyKeyboard()
 	_, err := b.SendMessage(ctx.EffectiveChat.Id, "📢 *Broadcast Mode Activated*\n\nPlease send the message you wish to broadcast to all registered users (text, photo, video, or document):", &gotgbot.SendMessageOpts{
 		ParseMode:   "Markdown",
 		ReplyMarkup: kb,
@@ -730,4 +740,12 @@ func isAuthMethodChoice(text string) bool {
 func isBackButton(text string) bool {
 	lower := strings.ToLower(text)
 	return strings.Contains(lower, "back") || strings.Contains(lower, "⬅️")
+}
+
+func isAbortButton(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "abort") ||
+		strings.Contains(lower, "cancel") ||
+		strings.Contains(lower, "🛑") ||
+		strings.Contains(lower, "❌")
 }
