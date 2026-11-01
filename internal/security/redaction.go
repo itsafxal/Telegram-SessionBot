@@ -9,9 +9,11 @@ import (
 
 var (
 	// Regex patterns for detecting potential sensitive credentials in logs
-	sessionPattern  = regexp.MustCompile(`(1[A-Za-z0-9+/=_-]{50,})`)
-	phonePattern    = regexp.MustCompile(`(\+?[0-9]{1,4})[0-9]{5,10}([0-9]{2})`)
-	botTokenPattern = regexp.MustCompile(`([0-9]{8,11}:[A-Za-z0-9_-]{30,})`)
+	sessionPattern    = regexp.MustCompile(`(1[A-Za-z0-9+/=_-]{50,})`)
+	phonePattern      = regexp.MustCompile(`(\+?[0-9]{1,4})[0-9]{5,10}([0-9]{2})`)
+	botTokenPattern   = regexp.MustCompile(`([0-9]{8,11}:[A-Za-z0-9_-]{30,})`)
+	mongoURIPattern   = regexp.MustCompile(`mongodb(?:\+srv)?:\/\/[^@\s]+@`)
+	authHeaderPattern = regexp.MustCompile(`(?i)(bearer\s+|basic\s+)[A-Za-z0-9._~+/-]+=*`)
 )
 
 // RedactPhone masks the middle digits of a phone number.
@@ -56,6 +58,8 @@ func RedactSession(session string) string {
 func SanitizeLogText(text string) string {
 	res := botTokenPattern.ReplaceAllString(text, "[REDACTED_BOT_TOKEN]")
 	res = sessionPattern.ReplaceAllString(res, "[REDACTED_SESSION_STRING]")
+	res = mongoURIPattern.ReplaceAllString(res, "mongodb://[REDACTED_AUTH]@")
+	res = authHeaderPattern.ReplaceAllString(res, "[REDACTED_AUTH_HEADER]")
 	return res
 }
 
@@ -125,8 +129,14 @@ func sanitizeAttr(a slog.Attr) slog.Attr {
 
 	case strings.Contains(keyLower, "token"),
 		strings.Contains(keyLower, "hash"),
-		strings.Contains(keyLower, "auth_key"):
+		strings.Contains(keyLower, "auth_key"),
+		strings.Contains(keyLower, "api_hash"):
 		return slog.String(a.Key, "[REDACTED_TOKEN]")
+
+	case strings.Contains(keyLower, "uri"),
+		strings.Contains(keyLower, "mongo"),
+		strings.Contains(keyLower, "database_url"):
+		return slog.String(a.Key, "[REDACTED_DB_URI]")
 
 	default:
 		if a.Value.Kind() == slog.KindString {

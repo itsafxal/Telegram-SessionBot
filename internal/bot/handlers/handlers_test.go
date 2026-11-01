@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PaulSonOfLars/gotgbot/v2"
+	"github.com/PaulSonOfLars/gotgbot/v2/ext"
 	"universal-session-generator/internal/auth"
 	"universal-session-generator/internal/config"
 )
@@ -67,5 +69,34 @@ func TestAbortClearsFSMState(t *testing.T) {
 	}
 	if authMgr.ActiveSessionsCount() != 0 {
 		t.Errorf("expected 0 active sessions after abort, got: %d", authMgr.ActiveSessionsCount())
+	}
+}
+
+func TestGroupChatRejection(t *testing.T) {
+	h := &HandlerContext{}
+	groupCtx := &ext.Context{
+		EffectiveChat: &gotgbot.Chat{
+			Id:   -100123456,
+			Type: "supergroup",
+		},
+		EffectiveSender: &gotgbot.Sender{
+			User: &gotgbot.User{
+				Id: 123456,
+			},
+		},
+	}
+
+	// Any handler invoked with group context must abort cleanly without processing
+	if err := h.GenerateSessionPrompt(nil, groupCtx); err != nil {
+		t.Errorf("expected nil error on rejected group prompt, got: %v", err)
+	}
+	if err := h.HandleProviderSelection(nil, groupCtx, "Pyrogram"); err != nil {
+		t.Errorf("expected nil error on rejected group provider selection, got: %v", err)
+	}
+	if err := h.HandleAuthMethodSelection(nil, groupCtx, "phone"); err != nil {
+		t.Errorf("expected nil error on rejected group auth method, got: %v", err)
+	}
+	if err := h.HandleAnyMessage(nil, groupCtx); err != nil {
+		t.Errorf("expected nil error on rejected group any message, got: %v", err)
 	}
 }

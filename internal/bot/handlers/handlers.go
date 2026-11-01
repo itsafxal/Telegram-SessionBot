@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
 	"universal-session-generator/internal/auth"
 	"universal-session-generator/internal/bot/keyboards"
+	"universal-session-generator/internal/bot/middleware"
 	"universal-session-generator/internal/broadcast"
 	"universal-session-generator/internal/database"
 	"universal-session-generator/internal/providers"
@@ -24,20 +26,42 @@ type HandlerContext struct {
 	BroadcastMgr *broadcast.Manager
 	DB           *database.Database
 	RateLimiter  *security.RateLimiter
+	qrMessages   map[int64]int64
+	qrMu         sync.Mutex
+}
+
+func (h *HandlerContext) setQRMessage(userID int64, msgID int64) {
+	h.qrMu.Lock()
+	defer h.qrMu.Unlock()
+	if h.qrMessages == nil {
+		h.qrMessages = make(map[int64]int64)
+	}
+	h.qrMessages[userID] = msgID
+}
+
+func (h *HandlerContext) deleteQRMessage(b *gotgbot.Bot, chatID int64, userID int64) {
+	h.qrMu.Lock()
+	msgID, ok := h.qrMessages[userID]
+	if ok {
+		delete(h.qrMessages, userID)
+	}
+	h.qrMu.Unlock()
+
+	if ok && msgID > 0 {
+		_, _ = b.DeleteMessage(chatID, msgID, nil)
+	}
 }
 
 // StartHandler handles the /start command.
 func (h *HandlerContext) StartHandler(b *gotgbot.Bot, ctx *ext.Context) error {
-	user := ctx.EffectiveSender.User
-	if user == nil {
+	if err := middleware.ValidatePrivateChat(ctx); err != nil {
+		if ctx.EffectiveChat != nil && ctx.EffectiveChat.Type != "private" {
+			_, _ = b.SendMessage(ctx.EffectiveChat.Id, "⚠️ For security reasons, authentication and session generation are strictly permitted only in private 1-on-1 chats with the bot.", nil)
+		}
 		return nil
 	}
 
-	// Enforce private chat only
-	if ctx.EffectiveChat.Type != "private" {
-		_, err := b.SendMessage(ctx.EffectiveChat.Id, "⚠️ For security reasons, this bot can only be used in private chats.", nil)
-		return err
-	}
+	user := ctx.EffectiveSender.User
 
 	// Check rate limit
 	if !h.RateLimiter.Allow(user.Id) {
@@ -54,7 +78,8 @@ func (h *HandlerContext) StartHandler(b *gotgbot.Bot, ctx *ext.Context) error {
 		}
 	}()
 
-	// Reset any previous auth state
+	// Reset any previous auth state and clean up QR message if exists
+	h.deleteQRMessage(b, ctx.EffectiveChat.Id, user.Id)
 	_ = h.AuthMgr.Cancel(context.Background(), user.Id)
 
 	welcome := `👋 *Welcome to Universal Telegram MTProto Session Generator!*
@@ -66,8 +91,11 @@ This bot enables you to safely generate native, production-ready String Sessions
 
 🛡️ *Strict Security Policy:*
 • *Zero Credential Storage:* OTP codes, 2FA passwords, phone numbers, and generated sessions are processed purely in memory and immediately discarded.
+• *Automatic Message Deletion:* Sensitive input messages (phone numbers, verification codes, cloud passwords) are automatically deleted from this chat for privacy.
 • *Validation Before Delivery:* Every session is validated via a fresh, isolated client before delivery.
-• *Safe Private Delivery:* Delivered exclusively to you in this private chat.
+• *Safe Private Delivery:* Delivered exclusively to your personal Telegram Saved Messages.
+
+ℹ️ *Privacy Advisory:* While credentials are auto-deleted, Telegram bot communication occurs over Telegram servers. Never use untrusted bots.
 
 Tap *🚀 Generate Session* below to begin.`
 
@@ -81,6 +109,10 @@ Tap *🚀 Generate Session* below to begin.`
 
 // HelpHandler displays help and instructions.
 func (h *HandlerContext) HelpHandler(b *gotgbot.Bot, ctx *ext.Context) error {
+	if err := middleware.ValidatePrivateChat(ctx); err != nil {
+		return nil
+	}
+
 	helpText := `ℹ️ *How to Generate an MTProto Session:*
 
 1. Tap *🚀 Generate Session*.
@@ -92,10 +124,10 @@ func (h *HandlerContext) HelpHandler(b *gotgbot.Bot, ctx *ext.Context) error {
    • If 2FA is active, enter your cloud password.
 5. For QR Login:
    • Scan the generated QR code in *Telegram Settings > Devices > Link Desktop Device*.
-6. The bot verifies the session through a fresh isolated client and delivers your native String Session here.
+6. The bot verifies the session through a fresh isolated client and delivers your native String Session directly to your Saved Messages.
 
-⚠️ *Security Advice:*
-Never share your String Session with untrusted bots or users. It provides full access to your account.`
+🔒 *Security Notice:*
+All sensitive messages containing your phone number, verification codes, or passwords are automatically deleted from this chat upon receipt. Session strings are delivered only to your Saved Messages and never stored on disk or database.`
 
 	kb := keyboards.MainMenuKeyboard()
 	_, err := b.SendMessage(ctx.EffectiveChat.Id, helpText, &gotgbot.SendMessageOpts{
@@ -107,6 +139,10 @@ Never share your String Session with untrusted bots or users. It provides full a
 
 // AboutHandler displays information about the application.
 func (h *HandlerContext) AboutHandler(b *gotgbot.Bot, ctx *ext.Context) error {
+	if err := middleware.ValidatePrivateChat(ctx); err != nil {
+		return nil
+	}
+
 	aboutText := `📖 *About Universal Telegram Session Generator*
 
 • *Core Principle:* One Telegram Bot. Three MTProto Libraries. One Unified Interface.
@@ -136,6 +172,7 @@ func (h *HandlerContext) AbortHandler(b *gotgbot.Bot, ctx *ext.Context) error {
 		return nil
 	}
 
+	h.deleteQRMessage(b, ctx.EffectiveChat.Id, user.Id)
 	_ = h.AuthMgr.Cancel(context.Background(), user.Id)
 	_ = h.BroadcastMgr.Cancel(user.Id)
 
@@ -153,6 +190,10 @@ func (h *HandlerContext) CancelHandler(b *gotgbot.Bot, ctx *ext.Context) error {
 
 // GenerateSessionPrompt starts provider selection.
 func (h *HandlerContext) GenerateSessionPrompt(b *gotgbot.Bot, ctx *ext.Context) error {
+	if err := middleware.ValidatePrivateChat(ctx); err != nil {
+		return nil
+	}
+
 	user := ctx.EffectiveSender.User
 	if user == nil {
 		return nil
@@ -188,6 +229,10 @@ Please select from the keyboard below:`
 
 // HandleProviderSelection processes provider selection buttons.
 func (h *HandlerContext) HandleProviderSelection(b *gotgbot.Bot, ctx *ext.Context, providerName string) error {
+	if err := middleware.ValidatePrivateChat(ctx); err != nil {
+		return nil
+	}
+
 	user := ctx.EffectiveSender.User
 	if user == nil {
 		return nil
@@ -237,6 +282,10 @@ Please send your Telegram phone number with international country code (e.g. `+"
 
 // HandleAuthMethodSelection processes choice between Phone and QR.
 func (h *HandlerContext) HandleAuthMethodSelection(b *gotgbot.Bot, ctx *ext.Context, method string) error {
+	if err := middleware.ValidatePrivateChat(ctx); err != nil {
+		return nil
+	}
+
 	user := ctx.EffectiveSender.User
 	if user == nil {
 		return nil
@@ -285,13 +334,16 @@ func (h *HandlerContext) triggerQRAuth(b *gotgbot.Bot, ctx *ext.Context, userID 
 ⏳ *Waiting for your authorization...*`
 
 	kb := keyboards.AbortOnlyKeyboard()
-	_, err = b.SendPhoto(ctx.EffectiveChat.Id, gotgbot.InputFileByReader("qr.png", bytes.NewReader(pngBytes)), &gotgbot.SendPhotoOpts{
+	sentPhoto, err := b.SendPhoto(ctx.EffectiveChat.Id, gotgbot.InputFileByReader("qr.png", bytes.NewReader(pngBytes)), &gotgbot.SendPhotoOpts{
 		Caption:     caption,
 		ParseMode:   "Markdown",
 		ReplyMarkup: kb,
 	})
 	if err != nil {
 		return err
+	}
+	if sentPhoto != nil {
+		h.setQRMessage(userID, sentPhoto.MessageId)
 	}
 
 	// Run background waiter for QR login
@@ -301,6 +353,7 @@ func (h *HandlerContext) triggerQRAuth(b *gotgbot.Bot, ctx *ext.Context, userID 
 
 		waitRes, waitErr := h.AuthMgr.WaitForQRLogin(waitCtx, userID)
 		if waitErr != nil {
+			h.deleteQRMessage(b, ctx.EffectiveChat.Id, userID)
 			sess := h.AuthMgr.GetSession(userID)
 			if sess == nil || sess.State == auth.StateCancelled || sess.State == auth.StateIdle {
 				// User already cancelled; exit quietly
@@ -315,6 +368,7 @@ func (h *HandlerContext) triggerQRAuth(b *gotgbot.Bot, ctx *ext.Context, userID 
 		}
 
 		if waitRes.Status == "error" {
+			h.deleteQRMessage(b, ctx.EffectiveChat.Id, userID)
 			_, _ = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("❌ QR Authentication failed: %s", waitRes.ErrorMessage), &gotgbot.SendMessageOpts{
 				ReplyMarkup: keyboards.MainMenuKeyboard(),
 			})
@@ -323,6 +377,7 @@ func (h *HandlerContext) triggerQRAuth(b *gotgbot.Bot, ctx *ext.Context, userID 
 		}
 
 		if waitRes.Status == "need_password" {
+			h.deleteQRMessage(b, ctx.EffectiveChat.Id, userID)
 			_, _ = b.SendMessage(ctx.EffectiveChat.Id, "🔐 *Two-Step Verification (2FA) is enabled on your account.*\n\nPlease send your cloud password below:", &gotgbot.SendMessageOpts{
 				ParseMode:   "Markdown",
 				ReplyMarkup: keyboards.AbortOnlyKeyboard(),
@@ -331,6 +386,7 @@ func (h *HandlerContext) triggerQRAuth(b *gotgbot.Bot, ctx *ext.Context, userID 
 		}
 
 		// Authorization confirmed! Generate and deliver session!
+		h.deleteQRMessage(b, ctx.EffectiveChat.Id, userID)
 		_ = h.finalizeSession(b, ctx.EffectiveChat.Id, userID)
 	}()
 
@@ -339,6 +395,10 @@ func (h *HandlerContext) triggerQRAuth(b *gotgbot.Bot, ctx *ext.Context, userID 
 
 // HandleAnyMessage routes any incoming message (text or media).
 func (h *HandlerContext) HandleAnyMessage(b *gotgbot.Bot, ctx *ext.Context) error {
+	if err := middleware.ValidatePrivateChat(ctx); err != nil {
+		return nil
+	}
+
 	msg := ctx.EffectiveMessage
 	user := ctx.EffectiveSender.User
 	if user == nil {
@@ -474,6 +534,11 @@ func (h *HandlerContext) handleMenuButtons(b *gotgbot.Bot, ctx *ext.Context, tex
 }
 
 func (h *HandlerContext) handlePhoneNumberInput(b *gotgbot.Bot, ctx *ext.Context, userID int64, phoneInput string) error {
+	// Automatically delete message containing user's phone number for privacy
+	if ctx.EffectiveMessage != nil {
+		_, _ = b.DeleteMessage(ctx.EffectiveChat.Id, ctx.EffectiveMessage.MessageId, nil)
+	}
+
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
@@ -510,6 +575,11 @@ Check your official Telegram app messages (or SMS).
 }
 
 func (h *HandlerContext) handleOTPInput(b *gotgbot.Bot, ctx *ext.Context, userID int64, otpInput string) error {
+	// Automatically delete message containing OTP code immediately
+	if ctx.EffectiveMessage != nil {
+		_, _ = b.DeleteMessage(ctx.EffectiveChat.Id, ctx.EffectiveMessage.MessageId, nil)
+	}
+
 	// Normalize code (remove spaces/hyphens)
 	cleanCode := strings.ReplaceAll(strings.ReplaceAll(otpInput, " ", ""), "-", "")
 
@@ -547,6 +617,11 @@ Please enter your 2FA password to complete authentication:
 }
 
 func (h *HandlerContext) handlePasswordInput(b *gotgbot.Bot, ctx *ext.Context, userID int64, passwordInput string) error {
+	// Automatically delete message containing 2FA password immediately
+	if ctx.EffectiveMessage != nil {
+		_, _ = b.DeleteMessage(ctx.EffectiveChat.Id, ctx.EffectiveMessage.MessageId, nil)
+	}
+
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 

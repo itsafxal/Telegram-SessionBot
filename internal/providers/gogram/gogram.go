@@ -190,39 +190,49 @@ func (p *Provider) StartQRAuth(ctx context.Context) (*providers.AuthResult, erro
 		return nil, errors.New("gogram client is closed")
 	}
 
-	res, err := p.client.AuthExportLoginToken(p.apiID, p.apiHash, nil)
-	if err != nil {
-		return &providers.AuthResult{
-			Status:       providers.StatusError,
-			ErrorMessage: fmt.Sprintf("Failed to initialize QR login: %v", err),
-		}, nil
-	}
-
-	switch tok := res.(type) {
-	case *telegram.AuthLoginTokenObj:
-		p.qrToken = tok.Token
-		p.qrExpires = tok.Expires
-		url := "tg://login?token=" + base64.RawURLEncoding.EncodeToString(tok.Token)
-		return &providers.AuthResult{
-			Status:     providers.StatusQRCode,
-			QRTokenURL: url,
-			QRExpires:  tok.Expires,
-		}, nil
-
-	case *telegram.AuthLoginTokenMigrateTo:
-		if err := p.client.SwitchDc(int(tok.DcID)); err != nil {
-			return nil, fmt.Errorf("failed to migrate DC: %w", err)
+	const maxDCMigrations = 3
+	for migration := 0; migration < maxDCMigrations; migration++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		return p.StartQRAuth(ctx)
 
-	case *telegram.AuthLoginTokenSuccess:
-		return &providers.AuthResult{
-			Status: providers.StatusSuccess,
-		}, nil
+		res, err := p.client.AuthExportLoginToken(p.apiID, p.apiHash, nil)
+		if err != nil {
+			return &providers.AuthResult{
+				Status:       providers.StatusError,
+				ErrorMessage: fmt.Sprintf("Failed to initialize QR login: %v", err),
+			}, nil
+		}
 
-	default:
-		return nil, errors.New("unsupported QR login token response from Telegram")
+		switch tok := res.(type) {
+		case *telegram.AuthLoginTokenObj:
+			p.qrToken = tok.Token
+			p.qrExpires = tok.Expires
+			url := "tg://login?token=" + base64.RawURLEncoding.EncodeToString(tok.Token)
+			return &providers.AuthResult{
+				Status:     providers.StatusQRCode,
+				QRTokenURL: url,
+				QRExpires:  tok.Expires,
+			}, nil
+
+		case *telegram.AuthLoginTokenMigrateTo:
+			if err := p.client.SwitchDc(int(tok.DcID)); err != nil {
+				return nil, fmt.Errorf("failed to migrate DC: %w", err)
+			}
+			// DC migrated successfully; loop to export login token on target DC without recursive lock acquisition
+			continue
+
+		case *telegram.AuthLoginTokenSuccess:
+			return &providers.AuthResult{
+				Status: providers.StatusSuccess,
+			}, nil
+
+		default:
+			return nil, errors.New("unsupported QR login token response from Telegram")
+		}
 	}
+
+	return nil, fmt.Errorf("exceeded maximum DC migration attempts (%d)", maxDCMigrations)
 }
 
 func (p *Provider) WaitForQRLogin(ctx context.Context) (*providers.AuthResult, error) {

@@ -139,7 +139,7 @@ func NewSessionStore(expiryTimeout time.Duration, onExpire func(userID int64)) *
 	return store
 }
 
-// Get retrieves the session for a user, or nil if none exists or if it expired.
+// Get retrieves an isolated snapshot of the session for a user, or nil if none exists or if it expired.
 func (s *SessionStore) Get(userID int64) *UserSession {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -153,10 +153,11 @@ func (s *SessionStore) Get(userID int64) *UserSession {
 		return nil
 	}
 
-	return sess
+	clone := *sess
+	return &clone
 }
 
-// GetOrCreate gets the existing session or creates a new Idle session.
+// GetOrCreate gets an isolated snapshot of the existing session or creates a new Idle session.
 func (s *SessionStore) GetOrCreate(userID int64) *UserSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -172,7 +173,23 @@ func (s *SessionStore) GetOrCreate(userID int64) *UserSession {
 		}
 		s.sessions[userID] = sess
 	}
-	return sess
+	clone := *sess
+	return &clone
+}
+
+// Update safely mutates a user's session under store write lock and refreshes UpdatedAt.
+func (s *SessionStore) Update(userID int64, fn func(sess *UserSession)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, exists := s.sessions[userID]
+	if !exists {
+		return errors.New("no active session found to update")
+	}
+
+	fn(sess)
+	sess.UpdatedAt = time.Now()
+	return nil
 }
 
 // SetState transitions a user session to a new state with validation.

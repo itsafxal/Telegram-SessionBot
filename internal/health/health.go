@@ -9,7 +9,6 @@ import (
 	"universal-session-generator/internal/auth"
 	"universal-session-generator/internal/bot/polling"
 	"universal-session-generator/internal/database"
-	"universal-session-generator/internal/providers"
 )
 
 // OverallStatus classifies the holistic health of the application.
@@ -33,16 +32,13 @@ type AuthHealth struct {
 	ActiveSessions int `json:"active_sessions"`
 }
 
-// Report holds the structured health response for /health.
+// Report holds the minimal, safe public health response for /health without leaking internal architecture or credentials.
 type Report struct {
 	Status        OverallStatus  `json:"status"`
 	Service       string         `json:"service"`
 	UptimeSeconds float64        `json:"uptime_seconds"`
 	Timestamp     time.Time      `json:"timestamp"`
 	Polling       polling.Status `json:"polling"`
-	Database      DatabaseHealth `json:"database"`
-	Auth          AuthHealth     `json:"auth"`
-	Providers     []string       `json:"providers"`
 }
 
 // Monitor coordinates health checks across all subsystems.
@@ -151,13 +147,7 @@ func (m *Monitor) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		pollingHealthy = m.supervisor.IsHealthy(90 * time.Second)
 	}
 
-	// 3. Auth status
-	authCount := 0
-	if m.authMgr != nil {
-		authCount = m.authMgr.ActiveSessionsCount()
-	}
-
-	// 4. Overall status classification
+	// 3. Overall status classification
 	overall := StatusHealthy
 	if dbHealth.Status != "connected" || !pollingHealthy {
 		if !pollingHealthy && pollStatus.State == polling.StateFatalError {
@@ -175,9 +165,6 @@ func (m *Monitor) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: time.Since(m.startTime).Seconds(),
 		Timestamp:     time.Now().UTC(),
 		Polling:       pollStatus,
-		Database:      dbHealth,
-		Auth:          AuthHealth{ActiveSessions: authCount},
-		Providers:     providers.List(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

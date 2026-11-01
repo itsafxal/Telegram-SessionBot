@@ -7,6 +7,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    networks:
+      - backend-net
     depends_on:
       mongo:
         condition: service_healthy
@@ -20,17 +22,26 @@ services:
     image: mongo:7.0
     container_name: universal-session-mongo
     restart: unless-stopped
-    ports:
-      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-session_admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-session_secure_pwd_replace_me}
+      MONGO_INITDB_DATABASE: ${MONGODB_DATABASE:-telegram_session_bot}
+    networks:
+      - backend-net
+    # Public 27017 port exposure removed for production network isolation; bot connects via internal bridge network
     volumes:
       - mongo_data:/data/db
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD", "mongosh", "-u", "${MONGO_INITDB_ROOT_USERNAME:-session_admin}", "-p", "${MONGO_INITDB_ROOT_PASSWORD:-session_secure_pwd_replace_me}", "--authenticationDatabase", "admin", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
 
+networks:
+  backend-net:
+    driver: bridge
+    internal: false
+
 volumes:
   mongo_data:
-

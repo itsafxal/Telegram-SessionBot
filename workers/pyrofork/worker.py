@@ -239,6 +239,22 @@ class PyroforkWorker:
         return {"status": "ok"}
 
 
+MAX_LINE_LENGTH = 512 * 1024  # 512 KB IPC line limit
+
+ALLOWED_ACTIONS = {
+    "init",
+    "send_code",
+    "start_qr",
+    "submit_otp",
+    "submit_password",
+    "export_session",
+    "validate_session",
+    "get_me",
+    "send_to_saved_messages",
+    "cancel",
+}
+
+
 async def main():
     worker = PyroforkWorker()
 
@@ -247,16 +263,39 @@ async def main():
         if not line:
             break
 
+        if len(line) > MAX_LINE_LENGTH:
+            sys.stderr.write("IPC message exceeds maximum permitted size\n")
+            sys.stderr.flush()
+            err_resp = {"id": "", "status": "error", "error": "IPC payload exceeds maximum allowed size"}
+            sys.stdout.write(json.dumps(err_resp) + "\n")
+            sys.stdout.flush()
+            continue
+
         line_str = line.strip()
         if not line_str:
             continue
 
         try:
             req = json.loads(line_str)
-            req_id = req.get("id", "")
-            action = req.get("action", "")
-            payload = req.get("payload") or {}
+        except json.JSONDecodeError as jde:
+            sys.stderr.write(f"Invalid JSON received on stdin: {str(jde)}\n")
+            sys.stderr.flush()
+            err_resp = {"id": "", "status": "error", "error": "Malformed JSON request"}
+            sys.stdout.write(json.dumps(err_resp) + "\n")
+            sys.stdout.flush()
+            continue
 
+        req_id = req.get("id", "")
+        action = req.get("action", "")
+        payload = req.get("payload") or {}
+
+        if action not in ALLOWED_ACTIONS:
+            err_resp = {"id": req_id, "status": "error", "error": f"Unauthorized or unknown action: {action}"}
+            sys.stdout.write(json.dumps(err_resp) + "\n")
+            sys.stdout.flush()
+            continue
+
+        try:
             if action == "init":
                 res = await worker.handle_init(payload)
             elif action == "send_code":
@@ -281,16 +320,14 @@ async def main():
                 sys.stdout.write(json.dumps(res) + "\n")
                 sys.stdout.flush()
                 break
-            else:
-                res = {"status": "error", "error": f"Unknown action: {action}"}
 
             res["id"] = req_id
             sys.stdout.write(json.dumps(res) + "\n")
             sys.stdout.flush()
         except Exception as e:
-            sys.stderr.write(f"Worker exception: {traceback.format_exc()}\n")
+            sys.stderr.write(f"Worker exception during action {action}: {traceback.format_exc()}\n")
             sys.stderr.flush()
-            err_resp = {"id": req.get("id", "") if 'req' in locals() else "", "status": "error", "error": str(e)}
+            err_resp = {"id": req_id, "status": "error", "error": str(e)}
             sys.stdout.write(json.dumps(err_resp) + "\n")
             sys.stdout.flush()
 

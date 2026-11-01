@@ -84,4 +84,3 @@ func TestHealthHandlerStructuredJSON(t *testing.T) {
 		t.Errorf("expected polling to be alive")
 	}
 }
-

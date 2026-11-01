@@ -3,6 +3,9 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -291,4 +294,154 @@ func TestCompleteAndDeliverToSavedMessages_DeliveryFails(t *testing.T) {
 	if !mock.cleanupCalled {
 		t.Errorf("expected cleanup to be invoked even if delivery fails")
 	}
+}
+
+func TestMaxConcurrentAuthEnforcement(t *testing.T) {
+	cfg := &config.Config{
+		SessionExpiryDuration: 5 * time.Minute,
+		WorkerTimeout:         2 * time.Second,
+		MaxConcurrentAuth:     2,
+	}
+	mgr := NewManager(cfg)
+
+	// User 1 acquires slot
+	ctx := context.Background()
+	if err := mgr.acquireSlot(ctx, 1001); err != nil {
+		t.Fatalf("user 1001 failed to acquire slot: %v", err)
+	}
+
+	// User 2 acquires slot
+	if err := mgr.acquireSlot(ctx, 1002); err != nil {
+		t.Fatalf("user 1002 failed to acquire slot: %v", err)
+	}
+
+	// User 3 must be rejected because MaxConcurrentAuth=2
+	err3 := mgr.acquireSlot(ctx, 1003)
+	if err3 == nil || !strings.Contains(err3.Error(), "maximum concurrent authentications") {
+		t.Fatalf("expected maximum concurrent error for user 1003, got: %v", err3)
+	}
+
+	// Release User 1 slot
+	mgr.releaseSlot(1001)
+
+	// User 3 can now acquire
+	if err := mgr.acquireSlot(ctx, 1003); err != nil {
+		t.Fatalf("user 1003 should acquire after slot release, got: %v", err)
+	}
+}
+
+type failingMockProvider struct {
+	mockProvider
+}
+
+func (f *failingMockProvider) SubmitOTP(ctx context.Context, phoneCode string) (*providers.AuthResult, error) {
+	return &providers.AuthResult{Status: providers.StatusError, ErrorMessage: "Invalid code"}, nil
+}
+
+func (f *failingMockProvider) SubmitPassword(ctx context.Context, password string) (*providers.AuthResult, error) {
+	return &providers.AuthResult{Status: providers.StatusError, ErrorMessage: "Invalid password"}, nil
+}
+
+func TestOTPBruteForceLockout(t *testing.T) {
+	mgr := newTestManager()
+	userID := int64(999111)
+
+	_ = mgr.store.GetOrCreate(userID)
+	_ = mgr.store.Update(userID, func(s *UserSession) {
+		s.State = StateAwaitingOTP
+	})
+	mock := &failingMockProvider{mockProvider: mockProvider{name: "TestFail"}}
+	mgr.mu.Lock()
+	mgr.activeProviders[userID] = mock
+	mgr.mu.Unlock()
+
+	ctx := context.Background()
+	// Attempt 1
+	res1, err1 := mgr.SubmitOTP(ctx, userID, "11111")
+	if err1 != nil || res1.Status != providers.StatusError {
+		t.Fatalf("attempt 1 expected error status, got res=%v, err=%v", res1, err1)
+	}
+
+	// Clear cooldown for test speed
+	mgr.mu.Lock()
+	delete(mgr.lastAttempt, userID)
+	mgr.mu.Unlock()
+
+	// Attempt 2
+	res2, err2 := mgr.SubmitOTP(ctx, userID, "22222")
+	if err2 != nil || res2.Status != providers.StatusError {
+		t.Fatalf("attempt 2 expected error status, got res=%v, err=%v", res2, err2)
+	}
+
+	mgr.mu.Lock()
+	delete(mgr.lastAttempt, userID)
+	mgr.mu.Unlock()
+
+	// Attempt 3: MUST trigger lockout and terminate session
+	_, err3 := mgr.SubmitOTP(ctx, userID, "33333")
+	if err3 == nil || !strings.Contains(err3.Error(), "too many failed verification code attempts") {
+		t.Fatalf("expected 3-attempt lockout termination error, got: %v", err3)
+	}
+
+	// Session must be cleared from store
+	if sess := mgr.store.Get(userID); sess != nil {
+		t.Fatalf("expected session to be cleared after lockout, found: %+v", sess)
+	}
+}
+
+func TestPasswordBruteForceLockout(t *testing.T) {
+	mgr := newTestManager()
+	userID := int64(999222)
+
+	_ = mgr.store.GetOrCreate(userID)
+	_ = mgr.store.Update(userID, func(s *UserSession) {
+		s.State = StateAwaitingTwoFactorPassword
+	})
+	mock := &failingMockProvider{mockProvider: mockProvider{name: "TestFail"}}
+	mgr.mu.Lock()
+	mgr.activeProviders[userID] = mock
+	mgr.mu.Unlock()
+
+	ctx := context.Background()
+	// Attempt 1
+	_, _ = mgr.SubmitPassword(ctx, userID, "pass1")
+	mgr.mu.Lock()
+	delete(mgr.lastAttempt, userID)
+	mgr.mu.Unlock()
+
+	// Attempt 2
+	_, _ = mgr.SubmitPassword(ctx, userID, "pass2")
+	mgr.mu.Lock()
+	delete(mgr.lastAttempt, userID)
+	mgr.mu.Unlock()
+
+	// Attempt 3: MUST trigger lockout
+	_, err3 := mgr.SubmitPassword(ctx, userID, "pass3")
+	if err3 == nil || !strings.Contains(err3.Error(), "too many failed two-step verification attempts") {
+		t.Fatalf("expected 3-attempt lockout error, got: %v", err3)
+	}
+
+	if sess := mgr.store.Get(userID); sess != nil {
+		t.Fatalf("expected session to be cleared after lockout, found: %+v", sess)
+	}
+}
+
+func TestConcurrentSessionAccessUnderRace(t *testing.T) {
+	mgr := newTestManager()
+	userID := int64(777666)
+	_ = mgr.StartSession(userID)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_ = mgr.store.Get(userID)
+			_ = mgr.store.Update(userID, func(s *UserSession) {
+				s.PhoneNumber = fmt.Sprintf("+1000%d", idx)
+			})
+			_ = mgr.store.SetState(userID, StateSelectingProvider)
+		}(i)
+	}
+	wg.Wait()
 }

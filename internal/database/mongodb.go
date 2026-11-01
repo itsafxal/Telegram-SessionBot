@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"universal-session-generator/internal/security"
 )
 
 // Database manages MongoDB connection and collections.
@@ -16,6 +18,18 @@ type Database struct {
 	client   *mongo.Client
 	db       *mongo.Database
 	usersCol *mongo.Collection
+}
+
+// isAuthError checks if a MongoDB error indicates authentication failure.
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "auth") ||
+		strings.Contains(msg, "authentication failed") ||
+		strings.Contains(msg, "bad auth") ||
+		strings.Contains(msg, "unauthorized")
 }
 
 // NewDatabase initializes a connection to MongoDB with retry logic and ping verification.
@@ -30,7 +44,7 @@ func NewDatabase(ctx context.Context, uri, dbName string) (*Database, error) {
 	var client *mongo.Client
 	var err error
 
-	// Retry connection up to 3 times with exponential backoff
+	// Retry connection up to 3 times with exponential backoff, failing immediately on auth errors
 	maxRetries := 3
 	for i := 1; i <= maxRetries; i++ {
 		client, err = mongo.Connect(opts)
@@ -43,7 +57,13 @@ func NewDatabase(ctx context.Context, uri, dbName string) (*Database, error) {
 			}
 		}
 
-		slog.Warn("Failed to connect to MongoDB, retrying...", "attempt", i, "max_retries", maxRetries, "error", err)
+		// Fail immediately if error is an authentication failure
+		if isAuthError(err) {
+			slog.Error("MongoDB authentication failed; verify credentials in MONGODB_URI", "error", security.SanitizeLogText(err.Error()))
+			return nil, fmt.Errorf("mongodb authentication failed: %w", err)
+		}
+
+		slog.Warn("Failed to connect to MongoDB, retrying...", "attempt", i, "max_retries", maxRetries, "error", security.SanitizeLogText(err.Error()))
 		if i < maxRetries {
 			time.Sleep(time.Duration(i*2) * time.Second)
 		}
@@ -64,7 +84,7 @@ func NewDatabase(ctx context.Context, uri, dbName string) (*Database, error) {
 
 	// Ensure unique index on user_id
 	if err := dbInstance.ensureIndexes(ctx); err != nil {
-		slog.Warn("Failed to create unique index on user_id", "error", err)
+		slog.Warn("Failed to create unique index on user_id", "error", security.SanitizeLogText(err.Error()))
 	} else {
 		slog.Info("MongoDB unique index on user_id verified")
 	}

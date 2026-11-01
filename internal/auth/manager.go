@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/skip2/go-qrcode"
 	"universal-session-generator/internal/config"
@@ -30,15 +31,34 @@ type Manager struct {
 	store           *SessionStore
 	activeProviders map[int64]providers.Provider
 	pendingInits    map[int64]*pendingInit
+	heldSlots       map[int64]bool
+	userOps         map[int64]chan struct{}
+	authSem         chan struct{}
+	phoneAttempts   map[int64]int
+	otpAttempts     map[int64]int
+	pwdAttempts     map[int64]int
+	lastAttempt     map[int64]time.Time
 	mu              sync.Mutex
 }
 
-// NewManager creates a new authentication manager.
+// NewManager creates a new authentication manager with concurrency bounding and brute-force protection.
 func NewManager(cfg *config.Config) *Manager {
+	maxAuth := cfg.MaxConcurrentAuth
+	if maxAuth <= 0 {
+		maxAuth = 50
+	}
+
 	mgr := &Manager{
 		cfg:             cfg,
 		activeProviders: make(map[int64]providers.Provider),
 		pendingInits:    make(map[int64]*pendingInit),
+		heldSlots:       make(map[int64]bool),
+		userOps:         make(map[int64]chan struct{}),
+		authSem:         make(chan struct{}, maxAuth),
+		phoneAttempts:   make(map[int64]int),
+		otpAttempts:     make(map[int64]int),
+		pwdAttempts:     make(map[int64]int),
+		lastAttempt:     make(map[int64]time.Time),
 	}
 
 	mgr.store = NewSessionStore(cfg.SessionExpiryDuration, func(userID int64) {
@@ -49,7 +69,7 @@ func NewManager(cfg *config.Config) *Manager {
 	return mgr
 }
 
-// GetSession retrieves the in-memory session for a user.
+// GetSession retrieves the in-memory session snapshot for a user.
 func (m *Manager) GetSession(userID int64) *UserSession {
 	return m.store.Get(userID)
 }
@@ -59,6 +79,114 @@ func (m *Manager) ActiveSessionsCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.activeProviders) + len(m.pendingInits)
+}
+
+// acquireSlot allocates a global concurrency slot for the user's authentication process.
+func (m *Manager) acquireSlot(ctx context.Context, userID int64) error {
+	m.mu.Lock()
+	if m.heldSlots[userID] {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
+	select {
+	case m.authSem <- struct{}{}:
+		m.mu.Lock()
+		if m.heldSlots[userID] {
+			select {
+			case <-m.authSem:
+			default:
+			}
+			m.mu.Unlock()
+			return nil
+		}
+		m.heldSlots[userID] = true
+		m.mu.Unlock()
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("concurrency wait cancelled: %w", ctx.Err())
+	default:
+		return errors.New("maximum concurrent authentications reached; please try again in a few moments")
+	}
+}
+
+// releaseSlot safely returns an authentication slot to the global semaphore.
+func (m *Manager) releaseSlot(userID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.heldSlots[userID] {
+		delete(m.heldSlots, userID)
+		select {
+		case <-m.authSem:
+		default:
+		}
+	}
+}
+
+// beginUserOp guarantees that only one authentication operation runs at a time per user.
+func (m *Manager) beginUserOp(userID int64) (func(), error) {
+	m.mu.Lock()
+	if _, busy := m.userOps[userID]; busy {
+		m.mu.Unlock()
+		return nil, errors.New("another operation is currently processing for this session. Please wait.")
+	}
+	done := make(chan struct{})
+	m.userOps[userID] = done
+	m.mu.Unlock()
+
+	return func() {
+		m.mu.Lock()
+		delete(m.userOps, userID)
+		close(done)
+		m.mu.Unlock()
+	}, nil
+}
+
+// checkCooldown enforces a minimum interval between verification submissions.
+func (m *Manager) checkCooldown(userID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	last, ok := m.lastAttempt[userID]
+	if ok && time.Since(last) < 2*time.Second {
+		return errors.New("please wait a moment before trying again")
+	}
+	m.lastAttempt[userID] = time.Now()
+	return nil
+}
+
+// recordOTPAttempt tracks failed OTP submissions and enforces a 3-attempt ceiling.
+func (m *Manager) recordOTPAttempt(userID int64, success bool) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if success {
+		m.otpAttempts[userID] = 0
+		return 0
+	}
+	m.otpAttempts[userID]++
+	return m.otpAttempts[userID]
+}
+
+// recordPasswordAttempt tracks failed 2FA password submissions and enforces a 3-attempt ceiling.
+func (m *Manager) recordPasswordAttempt(userID int64, success bool) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if success {
+		m.pwdAttempts[userID] = 0
+		return 0
+	}
+	m.pwdAttempts[userID]++
+	return m.pwdAttempts[userID]
+}
+
+// resetAttempts clears attempt counters and cooldown timers for a user.
+func (m *Manager) resetAttempts(userID int64) {
+	m.mu.Lock()
+	delete(m.phoneAttempts, userID)
+	delete(m.otpAttempts, userID)
+	delete(m.pwdAttempts, userID)
+	delete(m.lastAttempt, userID)
+	m.mu.Unlock()
 }
 
 // StartSession initiates provider selection for a user.
@@ -81,7 +209,9 @@ func (m *Manager) SelectProviderFast(userID int64, providerInput string) (bool, 
 	}
 
 	supportsQR := providers.SupportsQR(canonicalName)
-	sess.ProviderName = providers.DisplayName(canonicalName)
+	_ = m.store.Update(userID, func(s *UserSession) {
+		s.ProviderName = providers.DisplayName(canonicalName)
+	})
 
 	if supportsQR {
 		_ = m.store.SetState(userID, StateSelectingAuthMethod)
@@ -199,14 +329,18 @@ func (m *Manager) ChooseAuthMethod(userID int64, method string) (State, error) {
 		if !providers.SupportsQR(sess.ProviderName) {
 			return StateIdle, providers.ErrQRUnsupported
 		}
-		sess.AuthMethod = "qr"
+		_ = m.store.Update(userID, func(s *UserSession) {
+			s.AuthMethod = "qr"
+		})
 		if err := m.store.SetState(userID, StateAwaitingQRAuthentication); err != nil {
 			return StateIdle, err
 		}
 		return StateAwaitingQRAuthentication, nil
 	}
 
-	sess.AuthMethod = "phone"
+	_ = m.store.Update(userID, func(s *UserSession) {
+		s.AuthMethod = "phone"
+	})
 	if err := m.store.SetState(userID, StateAwaitingPhoneNumber); err != nil {
 		return StateIdle, err
 	}
@@ -215,6 +349,16 @@ func (m *Manager) ChooseAuthMethod(userID int64, method string) (State, error) {
 
 // StartPhoneAuth validates the phone number and requests an OTP code from Telegram.
 func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone string) (*providers.AuthResult, error) {
+	unlock, err := m.beginUserOp(userID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	if err := m.acquireSlot(ctx, userID); err != nil {
+		return nil, err
+	}
+
 	cleanedPhone := strings.ReplaceAll(strings.TrimSpace(rawPhone), " ", "")
 	if !strings.HasPrefix(cleanedPhone, "+") {
 		cleanedPhone = "+" + cleanedPhone
@@ -248,8 +392,10 @@ func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone str
 		return res, nil
 	}
 
-	sess.PhoneNumber = cleanedPhone
-	sess.PhoneCodeHash = res.PhoneCodeHash
+	_ = m.store.Update(userID, func(s *UserSession) {
+		s.PhoneNumber = cleanedPhone
+		s.PhoneCodeHash = res.PhoneCodeHash
+	})
 	_ = m.store.SetState(userID, StateAwaitingOTP)
 
 	return res, nil
@@ -257,6 +403,16 @@ func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone str
 
 // StartQRAuth begins QR code authentication and generates PNG bytes of the QR code.
 func (m *Manager) StartQRAuth(ctx context.Context, userID int64) (*providers.AuthResult, []byte, error) {
+	unlock, err := m.beginUserOp(userID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer unlock()
+
+	if err := m.acquireSlot(ctx, userID); err != nil {
+		return nil, nil, err
+	}
+
 	sess := m.store.Get(userID)
 	if sess == nil {
 		return nil, nil, errors.New("session not found")
@@ -309,8 +465,18 @@ func (m *Manager) WaitForQRLogin(ctx context.Context, userID int64) (*providers.
 	return res, nil
 }
 
-// SubmitOTP verifies the user-entered login code.
+// SubmitOTP verifies the user-entered login code with rate limit and attempt tracking.
 func (m *Manager) SubmitOTP(ctx context.Context, userID int64, otpCode string) (*providers.AuthResult, error) {
+	unlock, err := m.beginUserOp(userID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	if err := m.checkCooldown(userID); err != nil {
+		return nil, err
+	}
+
 	sess := m.store.Get(userID)
 	if sess == nil || sess.State != StateAwaitingOTP {
 		return nil, errors.New("not awaiting a verification code")
@@ -327,6 +493,16 @@ func (m *Manager) SubmitOTP(ctx context.Context, userID int64, otpCode string) (
 		return nil, err
 	}
 
+	if res.Status == providers.StatusError {
+		attempts := m.recordOTPAttempt(userID, false)
+		if attempts >= 3 {
+			_ = m.Cancel(ctx, userID)
+			return nil, errors.New("too many failed verification code attempts. Your authentication session has been terminated for security. Please restart with /start.")
+		}
+		return res, nil
+	}
+
+	m.recordOTPAttempt(userID, true)
 	if res.Status == providers.StatusNeedPassword {
 		_ = m.store.SetState(userID, StateAwaitingTwoFactorPassword)
 		return res, nil
@@ -335,8 +511,18 @@ func (m *Manager) SubmitOTP(ctx context.Context, userID int64, otpCode string) (
 	return res, nil
 }
 
-// SubmitPassword verifies the two-step verification password.
+// SubmitPassword verifies the two-step verification password with attempt tracking.
 func (m *Manager) SubmitPassword(ctx context.Context, userID int64, password string) (*providers.AuthResult, error) {
+	unlock, err := m.beginUserOp(userID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	if err := m.checkCooldown(userID); err != nil {
+		return nil, err
+	}
+
 	sess := m.store.Get(userID)
 	if sess == nil || sess.State != StateAwaitingTwoFactorPassword {
 		return nil, errors.New("not awaiting a two-step verification password")
@@ -353,12 +539,28 @@ func (m *Manager) SubmitPassword(ctx context.Context, userID int64, password str
 		return nil, err
 	}
 
+	if res.Status == providers.StatusError {
+		attempts := m.recordPasswordAttempt(userID, false)
+		if attempts >= 3 {
+			_ = m.Cancel(ctx, userID)
+			return nil, errors.New("too many failed two-step verification attempts. Your authentication session has been terminated for security. Please restart with /start.")
+		}
+		return res, nil
+	}
+
+	m.recordPasswordAttempt(userID, true)
 	return res, nil
 }
 
 // CompleteAndDeliverToSavedMessages verifies login, generates native session, validates fresh client,
 // delivers to Saved Messages, and verifies delivery.
 func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID int64) (*providers.AccountInfo, int64, error) {
+	unlock, err := m.beginUserOp(userID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer unlock()
+
 	sess := m.store.Get(userID)
 	if sess == nil {
 		return nil, 0, errors.New("no active session found")
@@ -450,6 +652,9 @@ func (m *Manager) Cancel(ctx context.Context, userID int64) error {
 	delete(m.pendingInits, userID)
 	m.mu.Unlock()
 
+	m.releaseSlot(userID)
+	m.resetAttempts(userID)
+
 	if ok && p != nil {
 		_ = p.Cancel(ctx)
 		p.Cleanup()
@@ -461,7 +666,7 @@ func (m *Manager) Cancel(ctx context.Context, userID int64) error {
 	return nil
 }
 
-// Cleanup releases all provider instances and removes memory traces.
+// Cleanup releases all provider instances, releases concurrency slots, and removes memory traces.
 func (m *Manager) Cleanup(userID int64) {
 	m.mu.Lock()
 	p, ok := m.activeProviders[userID]
@@ -470,6 +675,9 @@ func (m *Manager) Cleanup(userID int64) {
 	}
 	delete(m.pendingInits, userID)
 	m.mu.Unlock()
+
+	m.releaseSlot(userID)
+	m.resetAttempts(userID)
 
 	if ok && p != nil {
 		p.Cleanup()

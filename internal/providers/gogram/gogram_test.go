@@ -171,3 +171,30 @@ func TestGogramProviderMetadata(t *testing.T) {
 		t.Errorf("expected SupportsQR to be true for Gogram")
 	}
 }
+
+func TestGogramStartQRAuthNoDeadlock(t *testing.T) {
+	// Closed client must immediately return error without locking indefinitely
+	pClosed := &Provider{
+		apiID:   123456,
+		apiHash: "abcdef",
+		client:  nil,
+	}
+	ctx := context.Background()
+	_, err := pClosed.StartQRAuth(ctx)
+	if err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("expected closed client error, got: %v", err)
+	}
+
+	// Canceled context should abort without hanging
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	pCanceled := &Provider{
+		apiID:   123456,
+		apiHash: "abcdef",
+		client:  &telegram.Client{},
+	}
+	_, errCanceled := pCanceled.StartQRAuth(canceledCtx)
+	if errCanceled == nil {
+		t.Fatalf("expected error on canceled context, got nil")
+	}
+}
