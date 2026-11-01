@@ -30,6 +30,9 @@ type WorkerProcess struct {
 	timeout    time.Duration
 	closed     atomic.Bool
 	workerType string
+	waitDone   chan struct{}
+	waitErr    error
+	closeOnce  sync.Once
 }
 
 // StartWorker launches a new Python worker process and starts listening on its stdout/stderr.
@@ -75,6 +78,7 @@ func StartWorker(ctx context.Context, pythonPath, scriptPath, workerType string,
 		return nil, fmt.Errorf("failed to start %s worker process: %w", workerType, err)
 	}
 
+	waitDone := make(chan struct{})
 	worker := &WorkerProcess{
 		cmd:        cmd,
 		cancelFn:   procCancel,
@@ -83,7 +87,15 @@ func StartWorker(ctx context.Context, pythonPath, scriptPath, workerType string,
 		pending:    make(map[string]chan *Response),
 		timeout:    timeout,
 		workerType: workerType,
+		waitDone:   waitDone,
 	}
+
+	// Supervise process exit and reap exit code to prevent zombie processes
+	go func() {
+		worker.waitErr = cmd.Wait()
+		worker.closed.Store(true)
+		close(waitDone)
+	}()
 
 	// Dedicated background goroutine reading stdout continuously
 	go worker.readStdoutLoop(stdoutPipe)
@@ -147,12 +159,17 @@ func (w *WorkerProcess) IsAlive() bool {
 	if w.cmd == nil || w.cmd.Process == nil {
 		return false
 	}
-	return true
+	select {
+	case <-w.waitDone:
+		return false
+	default:
+		return true
+	}
 }
 
 // SendCommand sends a structured JSON request to the worker and waits for its corresponding response.
 func (w *WorkerProcess) SendCommand(ctx context.Context, action string, payload map[string]interface{}) (*Response, error) {
-	if w.closed.Load() {
+	if !w.IsAlive() {
 		return nil, errors.New("worker process is already closed")
 	}
 
@@ -181,7 +198,7 @@ func (w *WorkerProcess) SendCommand(ctx context.Context, action string, payload 
 	}()
 
 	w.writeMu.Lock()
-	if w.closed.Load() {
+	if !w.IsAlive() {
 		w.writeMu.Unlock()
 		return nil, errors.New("worker process closed before send")
 	}
@@ -208,6 +225,8 @@ func (w *WorkerProcess) SendCommand(ctx context.Context, action string, payload 
 		return nil, ctx.Err()
 	case <-timer.C:
 		return nil, fmt.Errorf("worker command '%s' timed out after %v", action, cmdTimeout)
+	case <-w.waitDone:
+		return nil, errors.New("worker process terminated unexpectedly")
 	case resp, ok := <-respChan:
 		if !ok || resp == nil {
 			return nil, errors.New("worker process terminated or closed stdout unexpectedly")
@@ -218,42 +237,46 @@ func (w *WorkerProcess) SendCommand(ctx context.Context, action string, payload 
 
 // Close gracefully terminates the worker process and frees all pipes.
 func (w *WorkerProcess) Close() error {
-	if w.closed.Swap(true) {
-		return nil
-	}
+	w.closeOnce.Do(func() {
+		w.closed.Store(true)
 
-	w.writeMu.Lock()
-	// Send cancel action before exiting
-	cancelReq, _ := json.Marshal(Request{
-		ID:     "exit",
-		Action: "cancel",
-	})
-	_, _ = fmt.Fprintf(w.stdin, "%s\n", cancelReq)
-	_ = w.stdin.Close()
-	w.writeMu.Unlock()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- w.cmd.Wait()
-	}()
-
-	select {
-	case <-time.After(2 * time.Second):
-		if w.cmd.Process != nil {
-			_ = w.cmd.Process.Kill()
+		w.writeMu.Lock()
+		if w.stdin != nil {
+			// Send cancel action before exiting
+			cancelReq, _ := json.Marshal(Request{
+				ID:     "exit",
+				Action: "cancel",
+			})
+			_, _ = fmt.Fprintf(w.stdin, "%s\n", cancelReq)
+			_ = w.stdin.Close()
 		}
+		w.writeMu.Unlock()
+
+		select {
+		case <-w.waitDone:
+		case <-time.After(2 * time.Second):
+			if w.cmd != nil && w.cmd.Process != nil {
+				_ = w.cmd.Process.Kill()
+			}
+			if w.cancelFn != nil {
+				w.cancelFn()
+			}
+			<-w.waitDone
+		}
+
 		if w.cancelFn != nil {
 			w.cancelFn()
 		}
-		<-done
-	case <-done:
-	}
 
-	if w.cancelFn != nil {
-		w.cancelFn()
-	}
+		w.pendingMu.Lock()
+		for id, ch := range w.pending {
+			close(ch)
+			delete(w.pending, id)
+		}
+		w.pendingMu.Unlock()
+	})
 
-	return nil
+	return w.waitErr
 }
 
 // streamStderr reads stderr lines and forwards them to slog with credential redaction.

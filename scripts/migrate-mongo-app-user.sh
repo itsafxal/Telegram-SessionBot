@@ -44,3 +44,4 @@ docker compose exec -e MONGO_APP_USERNAME="$MONGO_APP_USER" \
   /docker-entrypoint-initdb.d/init-app-user.js
 
 echo "[+] Migration completed successfully. Existing volumes and user data preserved."
+

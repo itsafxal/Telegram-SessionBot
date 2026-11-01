@@ -69,38 +69,56 @@ func (p *Provider) IsAlive() bool {
 	return p.worker != nil && p.worker.IsAlive()
 }
 
-// ensureWorkerLocked verifies the worker is alive, or restarts and reinitializes it automatically.
+// ensureWorkerLocked verifies the worker is alive, or restarts and reinitializes it automatically with bounded retries and backoff.
 func (p *Provider) ensureWorkerLocked(ctx context.Context) error {
 	if p.worker != nil && p.worker.IsAlive() {
 		return nil
 	}
 
-	if p.worker != nil {
-		_ = p.worker.Close()
-		p.worker = nil
+	const maxRetries = 3
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt*100) * time.Millisecond):
+			}
+		}
+
+		if p.worker != nil {
+			_ = p.worker.Close()
+			p.worker = nil
+		}
+
+		scriptPath := filepath.Join("workers", "pyrofork", "worker.py")
+		worker, err := workers.StartWorker(ctx, p.pythonPath, scriptPath, "pyrofork", p.timeout)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to launch pyrogram worker (attempt %d/%d): %w", attempt, maxRetries, err)
+			continue
+		}
+
+		resp, err := worker.SendCommand(ctx, "init", map[string]interface{}{
+			"api_id":   p.apiID,
+			"api_hash": p.apiHash,
+		})
+		if err != nil {
+			_ = worker.Close()
+			lastErr = fmt.Errorf("failed to initialize pyrogram client (attempt %d/%d): %w", attempt, maxRetries, err)
+			continue
+		}
+		if resp.Status != "ok" {
+			_ = worker.Close()
+			lastErr = fmt.Errorf("pyrogram init error (attempt %d/%d): %s", attempt, maxRetries, resp.Error)
+			continue
+		}
+
+		p.worker = worker
+		return nil
 	}
 
-	scriptPath := filepath.Join("workers", "pyrofork", "worker.py")
-	worker, err := workers.StartWorker(ctx, p.pythonPath, scriptPath, "pyrofork", p.timeout)
-	if err != nil {
-		return fmt.Errorf("failed to launch pyrogram worker: %w", err)
-	}
-
-	resp, err := worker.SendCommand(ctx, "init", map[string]interface{}{
-		"api_id":   p.apiID,
-		"api_hash": p.apiHash,
-	})
-	if err != nil {
-		_ = worker.Close()
-		return fmt.Errorf("failed to initialize pyrogram client: %w", err)
-	}
-	if resp.Status != "ok" {
-		_ = worker.Close()
-		return fmt.Errorf("pyrogram init error: %s", resp.Error)
-	}
-
-	p.worker = worker
-	return nil
+	return lastErr
 }
 
 func (p *Provider) StartPhoneAuth(ctx context.Context, phoneNumber string) (*providers.AuthResult, error) {
@@ -150,8 +168,8 @@ func (p *Provider) SubmitOTP(ctx context.Context, phoneCode string) (*providers.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.worker == nil {
-		return nil, errors.New("provider worker is closed")
+	if p.worker == nil || !p.worker.IsAlive() {
+		return nil, errors.New("authentication worker process terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	resp, err := p.worker.SendCommand(ctx, "submit_otp", map[string]interface{}{
@@ -183,8 +201,8 @@ func (p *Provider) SubmitPassword(ctx context.Context, password string) (*provid
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.worker == nil {
-		return nil, errors.New("provider worker is closed")
+	if p.worker == nil || !p.worker.IsAlive() {
+		return nil, errors.New("authentication worker process terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	resp, err := p.worker.SendCommand(ctx, "submit_password", map[string]interface{}{
@@ -210,8 +228,8 @@ func (p *Provider) ExportSession(ctx context.Context) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.worker == nil {
-		return "", errors.New("provider worker is closed")
+	if p.worker == nil || !p.worker.IsAlive() {
+		return "", errors.New("authentication worker process terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	resp, err := p.worker.SendCommand(ctx, "export_session", nil)
@@ -236,8 +254,8 @@ func (p *Provider) ValidateSession(ctx context.Context, sessionString string) (*
 	worker := p.worker
 	p.mu.Unlock()
 
-	if worker == nil {
-		return nil, errors.New("provider worker is closed")
+	if worker == nil || !worker.IsAlive() {
+		return nil, errors.New("authentication worker process terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	resp, err := worker.SendCommand(ctx, "validate_session", map[string]interface{}{
@@ -269,8 +287,8 @@ func (p *Provider) GetAccountInfo(ctx context.Context) (*providers.AccountInfo, 
 	worker := p.worker
 	p.mu.Unlock()
 
-	if worker == nil {
-		return nil, errors.New("provider worker is closed")
+	if worker == nil || !worker.IsAlive() {
+		return nil, errors.New("authentication worker process terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	resp, err := worker.SendCommand(ctx, "get_me", nil)
@@ -300,8 +318,8 @@ func (p *Provider) SendToSavedMessages(ctx context.Context, sessionString string
 	worker := p.worker
 	p.mu.Unlock()
 
-	if worker == nil {
-		return 0, errors.New("provider worker is closed")
+	if worker == nil || !worker.IsAlive() {
+		return 0, errors.New("authentication worker process terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	resp, err := worker.SendCommand(ctx, "send_to_saved_messages", map[string]interface{}{

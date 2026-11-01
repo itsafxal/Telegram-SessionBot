@@ -327,9 +327,15 @@ func (m *Manager) SelectProviderFast(userID int64, providerInput string) (bool, 
 	})
 
 	if supportsQR {
-		_ = m.store.SetState(userID, StateSelectingAuthMethod)
+		if err := m.store.SetState(userID, StateSelectingAuthMethod); err != nil {
+			m.releaseSlot(userID)
+			return false, err
+		}
 	} else {
-		_ = m.store.SetState(userID, StateAwaitingPhoneNumber)
+		if err := m.store.SetState(userID, StateAwaitingPhoneNumber); err != nil {
+			m.releaseSlot(userID)
+			return false, err
+		}
 	}
 
 	// Pre-warm the provider asynchronously in the background so expensive worker startup
@@ -391,60 +397,84 @@ func (m *Manager) SelectProvider(ctx context.Context, userID int64, providerInpu
 	return supportsQR, nil
 }
 
-// GetOrInitProvider returns the active provider for the user, waiting for any pending background initialization.
+// GetOrInitProvider returns the active provider for the user, waiting for any pending background initialization
+// and preventing duplicate worker creation during concurrent requests.
 func (m *Manager) GetOrInitProvider(ctx context.Context, userID int64) (providers.Provider, error) {
-	m.mu.Lock()
-	if p, ok := m.activeProviders[userID]; ok && p != nil {
-		if p.IsAlive() {
+	for {
+		m.mu.Lock()
+		if p, ok := m.activeProviders[userID]; ok && p != nil {
+			if p.IsAlive() {
+				m.mu.Unlock()
+				return p, nil
+			}
+			// Active provider is dead or closed; evict, cleanup, and re-instantiate cleanly
+			slog.Warn("Active provider is dead or worker process closed; re-instantiating", "user_id", userID, "provider", p.Name())
+			go p.Cleanup()
+			delete(m.activeProviders, userID)
+		}
+
+		pending, hasPending := m.pendingInits[userID]
+		if hasPending && pending != nil {
 			m.mu.Unlock()
-			return p, nil
-		}
-		// Active provider is dead or closed; evict, cleanup, and re-instantiate cleanly
-		slog.Warn("Active provider is dead or worker process closed; re-instantiating", "user_id", userID, "provider", p.Name())
-		go p.Cleanup()
-		delete(m.activeProviders, userID)
-	}
-
-	pending, hasPending := m.pendingInits[userID]
-	m.mu.Unlock()
-
-	if hasPending && pending != nil {
-		select {
-		case <-pending.done:
-			if pending.err != nil {
-				return nil, pending.err
+			select {
+			case <-pending.done:
+				if pending.err != nil {
+					return nil, pending.err
+				}
+				if pending.provider != nil && pending.provider.IsAlive() {
+					return pending.provider, nil
+				}
+				// Pre-warmed or concurrent provider completed but was dead or closed; loop to retry
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			}
-			if pending.provider != nil && pending.provider.IsAlive() {
-				return pending.provider, nil
-			}
-			// Pre-warmed provider completed but is no longer alive; fall through to synchronous re-creation
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		}
+
+		// Check session validity before registering initialization
+		sess := m.store.Get(userID)
+		if sess == nil || sess.ProviderName == "" {
+			m.mu.Unlock()
+			return nil, errors.New("no provider selected for session")
+		}
+
+		canonical := providers.NormalizeName(sess.ProviderName)
+
+		// Register single-flight initialization object under lock to prevent concurrent duplicate workers
+		initObj := &pendingInit{
+			done: make(chan struct{}),
+		}
+		m.pendingInits[userID] = initObj
+		m.mu.Unlock()
+
+		if err := m.acquireSlot(ctx, userID); err != nil {
+			m.mu.Lock()
+			delete(m.pendingInits, userID)
+			initObj.err = err
+			close(initObj.done)
+			m.mu.Unlock()
+			return nil, err
+		}
+
+		p, err := providers.Get(ctx, canonical, m.cfg.APIID, m.cfg.APIHash, m.cfg.PythonPath, m.cfg.WorkerTimeout)
+
+		m.mu.Lock()
+		delete(m.pendingInits, userID)
+		if err == nil {
+			m.activeProviders[userID] = p
+			initObj.provider = p
+		} else {
+			m.releaseSlotLocked(userID)
+			initObj.err = err
+		}
+		close(initObj.done)
+		m.mu.Unlock()
+
+		if err != nil {
+			return nil, err
+		}
+		return p, nil
 	}
-
-	// If no provider is active or pending, instantiate synchronously with resource admission
-	sess := m.store.Get(userID)
-	if sess == nil || sess.ProviderName == "" {
-		return nil, errors.New("no provider selected for session")
-	}
-
-	canonical := providers.NormalizeName(sess.ProviderName)
-	if err := m.acquireSlot(ctx, userID); err != nil {
-		return nil, err
-	}
-
-	p, err := providers.Get(ctx, canonical, m.cfg.APIID, m.cfg.APIHash, m.cfg.PythonPath, m.cfg.WorkerTimeout)
-	if err != nil {
-		m.releaseSlot(userID)
-		return nil, err
-	}
-
-	m.mu.Lock()
-	m.activeProviders[userID] = p
-	m.mu.Unlock()
-
-	return p, nil
 }
 
 // ChooseAuthMethod handles the choice between Phone and QR code when supported.

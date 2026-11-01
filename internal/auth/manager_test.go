@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -740,5 +741,59 @@ func TestStartQRAuthStateValidationBeforeSlot(t *testing.T) {
 	mgr.mu.Unlock()
 	if held {
 		t.Errorf("admission slot was leaked after invalid state in StartQRAuth")
+	}
+}
+
+func TestConcurrentGetOrInitProviderSingleFlight(t *testing.T) {
+	mgr := newTestManager()
+	userID := int64(9501)
+
+	var createCount atomic.Int32
+	providers.Register("test_single_flight", func(ctx context.Context, apiID int32, apiHash string, pythonPath string, timeout time.Duration) (providers.Provider, error) {
+		createCount.Add(1)
+		time.Sleep(50 * time.Millisecond) // Simulate process spawn latency
+		return &mockProvider{name: "TestSingleFlight"}, nil
+	})
+
+	_ = mgr.store.SetState(userID, StateSelectingProvider)
+	_ = mgr.store.Update(userID, func(s *UserSession) {
+		s.ProviderName = "test_single_flight"
+	})
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	const concurrency = 10
+	results := make([]providers.Provider, concurrency)
+	errs := make([]error, concurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			p, err := mgr.GetOrInitProvider(ctx, userID)
+			results[idx] = p
+			errs[idx] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i := 0; i < concurrency; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d encountered error: %v", i, errs[i])
+		}
+		if results[i] == nil {
+			t.Fatalf("goroutine %d got nil provider", i)
+		}
+		if results[i] != results[0] {
+			t.Errorf("goroutine %d got different provider instance than goroutine 0", i)
+		}
+	}
+
+	if count := createCount.Load(); count != 1 {
+		t.Errorf("expected exactly 1 provider creation during concurrent requests, got %d", count)
 	}
 }

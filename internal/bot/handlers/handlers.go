@@ -113,6 +113,12 @@ func (h *HandlerContext) HelpHandler(b *gotgbot.Bot, ctx *ext.Context) error {
 		return nil
 	}
 
+	user := ctx.EffectiveSender.User
+	if user != nil && !h.RateLimiter.Allow(user.Id) {
+		_, err := b.SendMessage(ctx.EffectiveChat.Id, "⏳ You are sending requests too quickly. Please wait a moment.", nil)
+		return err
+	}
+
 	helpText := `ℹ️ *How to Generate an MTProto Session:*
 
 1. Tap *🚀 Generate Session*.
@@ -141,6 +147,12 @@ All sensitive messages containing your phone number, verification codes, or pass
 func (h *HandlerContext) AboutHandler(b *gotgbot.Bot, ctx *ext.Context) error {
 	if err := middleware.ValidatePrivateChat(ctx); err != nil {
 		return nil
+	}
+
+	user := ctx.EffectiveSender.User
+	if user != nil && !h.RateLimiter.Allow(user.Id) {
+		_, err := b.SendMessage(ctx.EffectiveChat.Id, "⏳ You are sending requests too quickly. Please wait a moment.", nil)
+		return err
 	}
 
 	aboutText := `📖 *About Universal Telegram Session Generator*

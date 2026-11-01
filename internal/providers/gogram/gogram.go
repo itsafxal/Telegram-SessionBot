@@ -11,6 +11,7 @@ import (
 
 	"github.com/amarnathcjd/gogram/telegram"
 	"universal-session-generator/internal/providers"
+	"universal-session-generator/internal/security"
 )
 
 type Provider struct {
@@ -298,7 +299,7 @@ func (p *Provider) SubmitOTP(ctx context.Context, phoneCode string) (*providers.
 	}
 
 	if p.client == nil {
-		return nil, errors.New("gogram client is closed")
+		return nil, errors.New("authentication client terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	phoneCode = strings.TrimSpace(phoneCode)
@@ -342,9 +343,15 @@ func (p *Provider) SubmitOTP(ctx context.Context, phoneCode string) (*providers.
 				ErrorMessage: "Verification code cannot be empty.",
 			}, nil
 		}
+		if strings.Contains(errStr, "FLOOD_WAIT") {
+			return &providers.AuthResult{
+				Status:       providers.StatusError,
+				ErrorMessage: "Telegram flood wait limit reached. Please wait before retrying.",
+			}, nil
+		}
 		return &providers.AuthResult{
 			Status:       providers.StatusError,
-			ErrorMessage: fmt.Sprintf("Authentication failed: %s", errStr),
+			ErrorMessage: fmt.Sprintf("Authentication failed: %s", security.SanitizeLogText(errStr)),
 		}, nil
 	}
 
@@ -364,14 +371,14 @@ func (p *Provider) SubmitPassword(ctx context.Context, password string) (*provid
 	}
 
 	if p.client == nil {
-		return nil, errors.New("gogram client is closed")
+		return nil, errors.New("authentication client terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	accPwd, err := p.client.AccountGetPassword()
 	if err != nil {
 		return &providers.AuthResult{
 			Status:       providers.StatusError,
-			ErrorMessage: fmt.Sprintf("Failed to get 2FA parameters: %s", err.Error()),
+			ErrorMessage: fmt.Sprintf("Failed to get 2FA parameters: %s", security.SanitizeLogText(err.Error())),
 		}, nil
 	}
 
@@ -379,7 +386,7 @@ func (p *Provider) SubmitPassword(ctx context.Context, password string) (*provid
 	if err != nil {
 		return &providers.AuthResult{
 			Status:       providers.StatusError,
-			ErrorMessage: fmt.Sprintf("Failed to compute 2FA hash: %s", err.Error()),
+			ErrorMessage: "Failed to compute 2FA password verification hash.",
 		}, nil
 	}
 
@@ -391,9 +398,15 @@ func (p *Provider) SubmitPassword(ctx context.Context, password string) (*provid
 				ErrorMessage: "Incorrect two-step verification password. Please try again.",
 			}, nil
 		}
+		if strings.Contains(err.Error(), "FLOOD_WAIT") {
+			return &providers.AuthResult{
+				Status:       providers.StatusError,
+				ErrorMessage: "Telegram flood wait limit reached. Please wait before retrying.",
+			}, nil
+		}
 		return &providers.AuthResult{
 			Status:       providers.StatusError,
-			ErrorMessage: fmt.Sprintf("2FA verification failed: %s", err.Error()),
+			ErrorMessage: "Two-step verification failed. Please check your password and try again.",
 		}, nil
 	}
 
@@ -413,7 +426,7 @@ func (p *Provider) ExportSession(ctx context.Context) (string, error) {
 	}
 
 	if p.client == nil {
-		return "", errors.New("gogram client is closed")
+		return "", errors.New("authentication client terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	sessionStr := p.client.ExportSession()
@@ -470,7 +483,7 @@ func (p *Provider) GetAccountInfo(ctx context.Context) (*providers.AccountInfo, 
 	}
 
 	if p.client == nil {
-		return nil, errors.New("gogram client is closed")
+		return nil, errors.New("authentication client terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	user, err := p.client.GetMe()
@@ -495,7 +508,7 @@ func (p *Provider) SendToSavedMessages(ctx context.Context, sessionString string
 	}
 
 	if p.client == nil {
-		return 0, errors.New("gogram client is closed")
+		return 0, errors.New("authentication client terminated unexpectedly; session cannot be recovered. Please restart with /start")
 	}
 
 	user, err := p.client.GetMe()

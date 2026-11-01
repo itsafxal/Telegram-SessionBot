@@ -52,3 +52,4 @@ if (authResult.ok === 1 || authResult === 1) {
 }
 
 print('[Migration] Migration completed safely with zero data loss.');
+
