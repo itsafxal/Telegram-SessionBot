@@ -3,8 +3,8 @@
 # ==========================================
 FROM golang:1.24-alpine AS builder
 
-# Enable automatic Go toolchain management
-ENV GOTOOLCHAIN=auto
+# Ensure reproducible Go builds without auto-downloading external toolchains
+ENV GOTOOLCHAIN=local
 
 WORKDIR /build
 

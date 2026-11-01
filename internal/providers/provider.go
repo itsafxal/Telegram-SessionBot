@@ -82,6 +82,9 @@ type Provider interface {
 	// Cancel stops any in-progress authentication
 	Cancel(ctx context.Context) error
 
+	// IsAlive returns true if the underlying client or worker process is operational
+	IsAlive() bool
+
 	// Cleanup frees all resources, worker processes, and in-memory caches
 	Cleanup()
 }

@@ -62,12 +62,53 @@ func (p *Provider) SupportsQR() bool {
 	return false
 }
 
+// IsAlive returns true if the underlying Python worker process is running and not marked closed.
+func (p *Provider) IsAlive() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.worker != nil && p.worker.IsAlive()
+}
+
+// ensureWorkerLocked verifies the worker is alive, or restarts and reinitializes it automatically.
+func (p *Provider) ensureWorkerLocked(ctx context.Context) error {
+	if p.worker != nil && p.worker.IsAlive() {
+		return nil
+	}
+
+	if p.worker != nil {
+		_ = p.worker.Close()
+		p.worker = nil
+	}
+
+	scriptPath := filepath.Join("workers", "pyrofork", "worker.py")
+	worker, err := workers.StartWorker(ctx, p.pythonPath, scriptPath, "pyrofork", p.timeout)
+	if err != nil {
+		return fmt.Errorf("failed to launch pyrogram worker: %w", err)
+	}
+
+	resp, err := worker.SendCommand(ctx, "init", map[string]interface{}{
+		"api_id":   p.apiID,
+		"api_hash": p.apiHash,
+	})
+	if err != nil {
+		_ = worker.Close()
+		return fmt.Errorf("failed to initialize pyrogram client: %w", err)
+	}
+	if resp.Status != "ok" {
+		_ = worker.Close()
+		return fmt.Errorf("pyrogram init error: %s", resp.Error)
+	}
+
+	p.worker = worker
+	return nil
+}
+
 func (p *Provider) StartPhoneAuth(ctx context.Context, phoneNumber string) (*providers.AuthResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.worker == nil {
-		return nil, errors.New("provider worker is closed")
+	if err := p.ensureWorkerLocked(ctx); err != nil {
+		return nil, err
 	}
 
 	resp, err := p.worker.SendCommand(ctx, "send_code", map[string]interface{}{

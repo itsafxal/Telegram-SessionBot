@@ -70,13 +70,17 @@ func (p *Provider) SupportsQR() bool {
 }
 
 // sendCodeWithRetry calls AuthSendCode with non-nil CodeSettings and handles DC migration and connection initialization.
-func (p *Provider) sendCodeWithRetry(phoneNumber string, maxRetries int) (string, error) {
+func (p *Provider) sendCodeWithRetry(ctx context.Context, phoneNumber string, maxRetries int) (string, error) {
 	settings := &telegram.CodeSettings{
 		AllowAppHash:  true,
 		CurrentNumber: true,
 	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
 		sentCode, err := p.client.AuthSendCode(phoneNumber, p.apiID, p.apiHash, settings)
 		if err != nil {
 			if telegram.MatchError(err, "CONNECTION_NOT_INITED") {
@@ -136,7 +140,7 @@ func (p *Provider) StartPhoneAuth(ctx context.Context, phoneNumber string) (*pro
 	}
 
 	p.phoneNumber = cleanedPhone
-	phoneCodeHash, err := p.sendCodeWithRetry(p.phoneNumber, 3)
+	phoneCodeHash, err := p.sendCodeWithRetry(ctx, p.phoneNumber, 3)
 	if err != nil {
 		errStr := err.Error()
 		if strings.Contains(errStr, "PHONE_NUMBER_INVALID") {
@@ -289,6 +293,10 @@ func (p *Provider) SubmitOTP(ctx context.Context, phoneCode string) (*providers.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if p.client == nil {
 		return nil, errors.New("gogram client is closed")
 	}
@@ -351,6 +359,10 @@ func (p *Provider) SubmitPassword(ctx context.Context, password string) (*provid
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if p.client == nil {
 		return nil, errors.New("gogram client is closed")
 	}
@@ -396,6 +408,10 @@ func (p *Provider) ExportSession(ctx context.Context) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	if p.client == nil {
 		return "", errors.New("gogram client is closed")
 	}
@@ -409,6 +425,10 @@ func (p *Provider) ExportSession(ctx context.Context) (string, error) {
 }
 
 func (p *Provider) ValidateSession(ctx context.Context, sessionString string) (*providers.AccountInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Fresh isolated client to validate the exported session
 	valClient, err := telegram.NewClient(telegram.ClientConfig{
 		AppID:         p.apiID,
@@ -445,6 +465,10 @@ func (p *Provider) GetAccountInfo(ctx context.Context) (*providers.AccountInfo, 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if p.client == nil {
 		return nil, errors.New("gogram client is closed")
 	}
@@ -465,6 +489,10 @@ func (p *Provider) GetAccountInfo(ctx context.Context) (*providers.AccountInfo, 
 func (p *Provider) SendToSavedMessages(ctx context.Context, sessionString string) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 
 	if p.client == nil {
 		return 0, errors.New("gogram client is closed")
@@ -528,6 +556,13 @@ func (p *Provider) SendToSavedMessages(ctx context.Context, sessionString string
 func (p *Provider) Cancel(ctx context.Context) error {
 	p.Cleanup()
 	return nil
+}
+
+// IsAlive returns true if the Gogram client instance is initialized and operational.
+func (p *Provider) IsAlive() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.client != nil
 }
 
 func (p *Provider) Cleanup() {

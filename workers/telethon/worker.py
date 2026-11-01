@@ -68,17 +68,17 @@ class TelethonWorker:
                 },
             }
         except errors.PhoneNumberInvalidError:
-            return {"status": "error", "error": "Invalid phone number."}
+            return {"status": "error", "code": "PHONE_INVALID", "error": "Invalid phone number."}
         except errors.PhoneNumberUnoccupiedError:
-            return {"status": "error", "error": "This phone number is not registered on Telegram."}
+            return {"status": "error", "code": "PHONE_UNOCCUPIED", "error": "This phone number is not registered on Telegram."}
         except errors.FloodWaitError as e:
-            return {"status": "error", "error": f"Flood wait error. Please wait {e.seconds} seconds before retrying."}
+            return {"status": "error", "code": "FLOOD_WAIT", "error": f"Flood wait error. Please wait {e.seconds} seconds before retrying."}
         except Exception as e:
-            return {"status": "error", "error": sanitize_error(f"Failed to send code: {str(e)}")}
+            return {"status": "error", "code": "SEND_CODE_FAILED", "error": sanitize_error(f"Failed to send code: {str(e)}")}
 
     async def handle_start_qr(self, payload: dict) -> dict:
         if not self.client:
-            return {"status": "error", "error": "Client not initialized"}
+            return {"status": "error", "code": "CLIENT_NOT_INITIALIZED", "error": "Client not initialized"}
 
         try:
             await self.ensure_connected()
@@ -97,11 +97,11 @@ class TelethonWorker:
                 },
             }
         except Exception as e:
-            return {"status": "error", "error": sanitize_error(f"Failed to initialize QR login: {str(e)}")}
+            return {"status": "error", "code": "QR_INIT_FAILED", "error": sanitize_error(f"Failed to initialize QR login: {str(e)}")}
 
     async def handle_wait_qr(self, payload: dict) -> dict:
         if not self.qr_login_obj:
-            return {"status": "error", "error": "QR login was not started"}
+            return {"status": "error", "code": "QR_NOT_STARTED", "error": "QR login was not started"}
 
         try:
             user = await self.qr_login_obj.wait(timeout=180)
@@ -117,13 +117,13 @@ class TelethonWorker:
         except errors.SessionPasswordNeededError:
             return {"status": "need_password"}
         except asyncio.TimeoutError:
-            return {"status": "error", "error": "QR login timed out. Please request a new QR code."}
+            return {"status": "error", "code": "QR_TIMEOUT", "error": "QR login timed out. Please request a new QR code."}
         except Exception as e:
-            return {"status": "error", "error": sanitize_error(f"QR authentication failed: {str(e)}")}
+            return {"status": "error", "code": "QR_WAIT_FAILED", "error": sanitize_error(f"QR authentication failed: {str(e)}")}
 
     async def handle_submit_otp(self, payload: dict) -> dict:
         if not self.client or not self.phone_number:
-            return {"status": "error", "error": "Missing active phone verification session"}
+            return {"status": "error", "code": "SESSION_MISSING", "error": "Missing active phone verification session"}
 
         phone_code = str(payload["phone_code"]).strip()
         try:
@@ -137,29 +137,30 @@ class TelethonWorker:
         except errors.SessionPasswordNeededError:
             return {"status": "need_password"}
         except (errors.PhoneCodeInvalidError, errors.PhoneCodeEmptyError):
-            return {"status": "error", "error": "Invalid verification code."}
+            return {"status": "error", "code": "CODE_INVALID", "error": "Invalid verification code."}
         except errors.PhoneCodeExpiredError:
-            return {"status": "error", "error": "Verification code has expired. Please request a new one."}
+            return {"status": "error", "code": "CODE_EXPIRED", "error": "Verification code has expired. Please request a new one."}
         except errors.FloodWaitError as e:
-            return {"status": "error", "error": f"Flood wait error. Please wait {e.seconds} seconds."}
+            return {"status": "error", "code": "FLOOD_WAIT", "error": f"Flood wait error. Please wait {e.seconds} seconds."}
         except Exception as e:
-            return {"status": "error", "error": sanitize_error(f"Verification failed: {str(e)}")}
+            return {"status": "error", "code": "OTP_VERIFY_FAILED", "error": sanitize_error(f"Verification failed: {str(e)}")}
 
     async def handle_submit_password(self, payload: dict) -> dict:
         if not self.client:
-            return {"status": "error", "error": "Client not initialized"}
+            return {"status": "error", "code": "CLIENT_NOT_INITIALIZED", "error": "Client not initialized"}
 
-        password = str(payload["password"])
+        password = str(payload.get("password", ""))
         try:
             await self.ensure_connected()
             await self.client.sign_in(password=password)
             return {"status": "ok"}
         except (errors.PasswordHashInvalidError, errors.PasswordEmptyError):
-            return {"status": "error", "error": "Incorrect two-step verification password."}
+            return {"status": "error", "code": "PASSWORD_INVALID", "error": "Incorrect two-step verification password."}
         except errors.FloodWaitError as e:
-            return {"status": "error", "error": f"Flood wait error. Please wait {e.seconds} seconds."}
-        except Exception as e:
-            return {"status": "error", "error": sanitize_error(f"2FA verification failed: {str(e)}")}
+            return {"status": "error", "code": "FLOOD_WAIT", "error": f"Flood wait error. Please wait {e.seconds} seconds."}
+        except Exception:
+            # Completely redact 2FA error details to prevent leaking passwords in exception representations
+            return {"status": "error", "code": "PASSWORD_VERIFY_FAILED", "error": "Two-step verification failed. Please verify your password and retry."}
 
     async def handle_export_session(self, payload: dict) -> dict:
         if not self.client:
@@ -298,99 +299,123 @@ ALLOWED_ACTIONS = {
 }
 
 
+# Configure UTF-8 encoding across Windows and POSIX standard streams
+if hasattr(sys.stdin, "reconfigure"):
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 def read_bounded_line(max_len: int = MAX_LINE_LENGTH) -> str | None:
     """Reads at most max_len+1 chars from sys.stdin to prevent memory DOS, draining overflow safely."""
-    chunk = sys.stdin.readline(max_len + 1)
-    if not chunk:
+    try:
+        chunk = sys.stdin.readline(max_len + 1)
+        if not chunk:
+            return None
+        if len(chunk) > max_len:
+            # Drain rest of line until newline to maintain parser synchronization
+            while True:
+                extra = sys.stdin.readline(8192)
+                if not extra or extra.endswith('\n'):
+                    break
+            return "EXCEEDED_MAX_LENGTH"
+        return chunk
+    except Exception as e:
+        sys.stderr.write(f"Stdin read exception: {sanitize_error(str(e))}\n")
+        sys.stderr.flush()
         return None
-    if len(chunk) > max_len:
-        # Drain rest of line until newline to maintain parser synchronization
-        while True:
-            extra = sys.stdin.readline(8192)
-            if not extra or extra.endswith('\n'):
-                break
-        return "EXCEEDED_MAX_LENGTH"
-    return chunk
 
 
 async def main():
     worker = TelethonWorker()
 
     while True:
-        line = await asyncio.to_thread(read_bounded_line, MAX_LINE_LENGTH)
-        if line is None:
-            break
-
-        if line == "EXCEEDED_MAX_LENGTH":
-            sys.stderr.write("IPC message exceeds maximum permitted size\n")
-            sys.stderr.flush()
-            err_resp = {"id": "", "status": "error", "error": "IPC payload exceeds maximum allowed size"}
-            sys.stdout.write(json.dumps(err_resp) + "\n")
-            sys.stdout.flush()
-            continue
-
-        line_str = line.strip()
-        if not line_str:
-            continue
-
         try:
-            req = json.loads(line_str)
-        except json.JSONDecodeError as jde:
-            sys.stderr.write(f"Invalid JSON received on stdin: {str(jde)}\n")
-            sys.stderr.flush()
-            err_resp = {"id": "", "status": "error", "error": "Malformed JSON request"}
-            sys.stdout.write(json.dumps(err_resp) + "\n")
-            sys.stdout.flush()
-            continue
+            line = await asyncio.to_thread(read_bounded_line, MAX_LINE_LENGTH)
+            if line is None:
+                break
 
-        req_id = req.get("id", "")
-        action = req.get("action", "")
-        payload = req.get("payload") or {}
+            if line == "EXCEEDED_MAX_LENGTH":
+                sys.stderr.write("IPC message exceeds maximum permitted size\n")
+                sys.stderr.flush()
+                err_resp = {"id": "", "status": "error", "error": "IPC payload exceeds maximum allowed size"}
+                sys.stdout.write(json.dumps(err_resp) + "\n")
+                sys.stdout.flush()
+                continue
 
-        if action not in ALLOWED_ACTIONS:
-            err_resp = {"id": req_id, "status": "error", "error": f"Unauthorized or unknown action: {action}"}
-            sys.stdout.write(json.dumps(err_resp) + "\n")
-            sys.stdout.flush()
-            continue
+            line_str = line.strip()
+            if not line_str:
+                continue
 
-        try:
-            if action == "init":
-                res = await worker.handle_init(payload)
-            elif action == "send_code":
-                res = await worker.handle_send_code(payload)
-            elif action == "start_qr":
-                res = await worker.handle_start_qr(payload)
-            elif action == "wait_qr":
-                res = await worker.handle_wait_qr(payload)
-            elif action == "submit_otp":
-                res = await worker.handle_submit_otp(payload)
-            elif action == "submit_password":
-                res = await worker.handle_submit_password(payload)
-            elif action == "export_session":
-                res = await worker.handle_export_session(payload)
-            elif action == "validate_session":
-                res = await worker.handle_validate_session(payload)
-            elif action == "get_me":
-                res = await worker.handle_get_me(payload)
-            elif action == "send_to_saved_messages":
-                res = await worker.handle_send_to_saved_messages(payload)
-            elif action == "cancel":
-                res = await worker.handle_cancel(payload)
+            try:
+                req = json.loads(line_str)
+            except json.JSONDecodeError as jde:
+                sys.stderr.write(f"Invalid JSON received on stdin: {str(jde)}\n")
+                sys.stderr.flush()
+                err_resp = {"id": "", "status": "error", "error": "Malformed JSON request"}
+                sys.stdout.write(json.dumps(err_resp) + "\n")
+                sys.stdout.flush()
+                continue
+
+            req_id = req.get("id", "")
+            action = req.get("action", "")
+            payload = req.get("payload") or {}
+
+            if action not in ALLOWED_ACTIONS:
+                err_resp = {"id": req_id, "status": "error", "error": f"Unauthorized or unknown action: {action}"}
+                sys.stdout.write(json.dumps(err_resp) + "\n")
+                sys.stdout.flush()
+                continue
+
+            try:
+                if action == "init":
+                    res = await worker.handle_init(payload)
+                elif action == "send_code":
+                    res = await worker.handle_send_code(payload)
+                elif action == "start_qr":
+                    res = await worker.handle_start_qr(payload)
+                elif action == "wait_qr":
+                    res = await worker.handle_wait_qr(payload)
+                elif action == "submit_otp":
+                    res = await worker.handle_submit_otp(payload)
+                elif action == "submit_password":
+                    res = await worker.handle_submit_password(payload)
+                elif action == "export_session":
+                    res = await worker.handle_export_session(payload)
+                elif action == "validate_session":
+                    res = await worker.handle_validate_session(payload)
+                elif action == "get_me":
+                    res = await worker.handle_get_me(payload)
+                elif action == "send_to_saved_messages":
+                    res = await worker.handle_send_to_saved_messages(payload)
+                elif action == "cancel":
+                    res = await worker.handle_cancel(payload)
+                    res["id"] = req_id
+                    sys.stdout.write(json.dumps(res) + "\n")
+                    sys.stdout.flush()
+                    break
+
                 res["id"] = req_id
                 sys.stdout.write(json.dumps(res) + "\n")
                 sys.stdout.flush()
-                break
-
-            res["id"] = req_id
-            sys.stdout.write(json.dumps(res) + "\n")
-            sys.stdout.flush()
-        except Exception as e:
-            sanitized_tb = sanitize_error(traceback.format_exc())
-            sys.stderr.write(f"Worker exception during action {action}: {sanitized_tb}\n")
+            except Exception as e:
+                sanitized_tb = sanitize_error(traceback.format_exc())
+                sys.stderr.write(f"Worker exception during action {action}: {sanitized_tb}\n")
+                sys.stderr.flush()
+                err_resp = {"id": req_id, "status": "error", "error": sanitize_error(str(e))}
+                sys.stdout.write(json.dumps(err_resp) + "\n")
+                sys.stdout.flush()
+        except (KeyboardInterrupt, SystemExit):
+            break
+        except Exception as loop_e:
+            sys.stderr.write(f"Worker main loop error: {sanitize_error(str(loop_e))}\n")
             sys.stderr.flush()
-            err_resp = {"id": req_id, "status": "error", "error": sanitize_error(str(e))}
-            sys.stdout.write(json.dumps(err_resp) + "\n")
-            sys.stdout.flush()
 
     if worker.client:
         try:
@@ -401,4 +426,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        sys.exit(0)
+    except Exception as fatal_e:
+        sys.stderr.write(f"Fatal worker exception: {sanitize_error(str(fatal_e))}\n")
+        sys.stderr.flush()
+        sys.exit(1)

@@ -19,15 +19,15 @@ services:
         max-file: "3"
 
   mongo:
-    image: mongo:7.0
+    image: mongo:7.0.16
     container_name: universal-session-mongo
     restart: unless-stopped
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME environment variable is required}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD environment variable is required}
       MONGO_INITDB_DATABASE: ${MONGODB_DATABASE:-telegram_session_bot}
-      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-session_app_user}
-      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:?MONGO_APP_USERNAME environment variable is required}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?MONGO_APP_PASSWORD environment variable is required}
     networks:
       - backend-net
     volumes:

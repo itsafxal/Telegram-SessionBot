@@ -53,25 +53,18 @@ func Load() (*Config, error) {
 		return nil, errors.New("missing required environment variable: API_HASH")
 	}
 
+	mongoDB := strings.TrimSpace(os.Getenv("MONGODB_DATABASE"))
+	if mongoDB == "" {
+		mongoDB = "telegram_session_bot"
+	}
+
 	mongoURI := strings.TrimSpace(os.Getenv("MONGODB_URI"))
 	if mongoURI == "" {
 		return nil, errors.New("missing required environment variable: MONGODB_URI")
 	}
 
-	insecurePlaceholders := []string{
-		"session_secure_pwd_replace_me",
-		"change_me",
-		":password@",
-	}
-	for _, placeholder := range insecurePlaceholders {
-		if strings.Contains(strings.ToLower(mongoURI), placeholder) {
-			return nil, fmt.Errorf("insecure placeholder credential '%s' detected in MONGODB_URI; please provide a secure unique production password", placeholder)
-		}
-	}
-
-	mongoDB := strings.TrimSpace(os.Getenv("MONGODB_DATABASE"))
-	if mongoDB == "" {
-		mongoDB = "telegram_session_bot"
+	if err := validateMongoURI(mongoURI, mongoDB); err != nil {
+		return nil, err
 	}
 
 	ownerIDStr := strings.TrimSpace(os.Getenv("OWNER_ID"))
@@ -142,6 +135,58 @@ func Load() (*Config, error) {
 		LogLevel:              logLevel,
 		SessionExpiryDuration: 10 * time.Minute,
 	}, nil
+}
+
+// validateMongoURI verifies scheme, credential presence, rejects placeholders, empty passwords, and root user usage.
+func validateMongoURI(uri, dbName string) error {
+	trimmed := strings.TrimSpace(uri)
+	lower := strings.ToLower(trimmed)
+
+	if !strings.HasPrefix(lower, "mongodb://") && !strings.HasPrefix(lower, "mongodb+srv://") {
+		return fmt.Errorf("invalid MONGODB_URI scheme: must begin with 'mongodb://' or 'mongodb+srv://'")
+	}
+
+	insecurePlaceholders := []string{
+		"session_secure_pwd_replace_me",
+		"change_me",
+		":password@",
+		"admin:admin@",
+		"root:root@",
+	}
+	for _, placeholder := range insecurePlaceholders {
+		if strings.Contains(lower, placeholder) {
+			return fmt.Errorf("insecure placeholder credential '%s' detected in MONGODB_URI; please provide a secure unique production password", placeholder)
+		}
+	}
+
+	afterScheme := trimmed
+	if idx := strings.Index(trimmed, "://"); idx != -1 {
+		afterScheme = trimmed[idx+3:]
+	}
+
+	if atIdx := strings.Index(afterScheme, "@"); atIdx != -1 {
+		userinfo := afterScheme[:atIdx]
+		parts := strings.SplitN(userinfo, ":", 2)
+		user := parts[0]
+		pass := ""
+		if len(parts) > 1 {
+			pass = parts[1]
+		}
+
+		if pass == "" {
+			return errors.New("invalid MONGODB_URI: empty password is prohibited")
+		}
+
+		// Reject root/admin credential usage by the application
+		rootUser := strings.TrimSpace(os.Getenv("MONGO_ROOT_USERNAME"))
+		if (rootUser != "" && strings.EqualFold(user, rootUser)) ||
+			strings.EqualFold(user, "root") ||
+			(strings.EqualFold(user, "admin") && strings.Contains(lower, "authsource=admin")) {
+			return errors.New("insecure configuration: application MONGODB_URI cannot use MongoDB root/admin credentials; use a dedicated least-privilege application user")
+		}
+	}
+
+	return nil
 }
 
 // detectPythonPath looks for python3 or python in PATH.

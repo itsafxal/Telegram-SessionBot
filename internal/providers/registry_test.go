@@ -34,6 +34,7 @@ func (d *dummyProvider) SendToSavedMessages(ctx context.Context, s string) (int6
 	return 999, nil
 }
 func (d *dummyProvider) Cancel(ctx context.Context) error { return nil }
+func (d *dummyProvider) IsAlive() bool                    { return true }
 func (d *dummyProvider) Cleanup()                         {}
 
 func TestRegistry(t *testing.T) {

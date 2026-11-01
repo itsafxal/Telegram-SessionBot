@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,5 +83,29 @@ func TestHealthHandlerStructuredJSON(t *testing.T) {
 	}
 	if !report.Polling.IsAlive {
 		t.Errorf("expected polling to be alive")
+	}
+}
+
+func TestHealthHandlerNoInformationDisclosure(t *testing.T) {
+	s := polling.NewSupervisor(nil, nil, polling.DefaultConfig())
+	s.StartFakeRunning(time.Now())
+
+	m := NewMonitor(s, nil, nil)
+	req := httptest.NewRequest("GET", "/health", nil)
+	rr := httptest.NewRecorder()
+
+	m.HealthHandler(rr, req)
+
+	var rawMap map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &rawMap); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+
+	bodyStr := rr.Body.String()
+	sensitiveFields := []string{"last_error", "last_update_id", "consecutive_errors", "total_updates_handled"}
+	for _, field := range sensitiveFields {
+		if strings.Contains(bodyStr, field) {
+			t.Errorf("information disclosure vulnerability: /health response contains %q", field)
+		}
 	}
 }

@@ -41,6 +41,7 @@ type Manager struct {
 	otpAttempts     map[int64]int
 	pwdAttempts     map[int64]int
 	lastAttempt     map[int64]time.Time
+	globalPhoneSem  chan struct{}
 	mu              sync.Mutex
 }
 
@@ -65,6 +66,7 @@ func NewManager(cfg *config.Config) *Manager {
 		otpAttempts:     make(map[int64]int),
 		pwdAttempts:     make(map[int64]int),
 		lastAttempt:     make(map[int64]time.Time),
+		globalPhoneSem:  make(chan struct{}, 15),
 	}
 
 	mgr.store = NewSessionStore(cfg.SessionExpiryDuration, func(userID int64) {
@@ -179,10 +181,34 @@ func (m *Manager) beginUserOp(userID int64) (func(), error) {
 	return cleanup, err
 }
 
-// checkPhoneRateLimit enforces cooldown and max attempts ceiling for phone submissions.
+// pruneRateLimitsLocked evicts stale rate limiting entries to maintain bounded memory.
+func (m *Manager) pruneRateLimitsLocked() {
+	now := time.Now()
+	expiry := m.cfg.SessionExpiryDuration
+	if expiry <= 0 {
+		expiry = 10 * time.Minute
+	}
+	for uid, t := range m.lastPhoneTime {
+		if now.Sub(t) > expiry {
+			delete(m.lastPhoneTime, uid)
+			delete(m.phoneAttempts, uid)
+		}
+	}
+	for uid, t := range m.lastAttempt {
+		if now.Sub(t) > expiry {
+			delete(m.lastAttempt, uid)
+			delete(m.otpAttempts, uid)
+			delete(m.pwdAttempts, uid)
+		}
+	}
+}
+
+// checkPhoneRateLimit enforces global throttling, per-user cooldown, and max attempts ceiling.
 func (m *Manager) checkPhoneRateLimit(userID int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	m.pruneRateLimitsLocked()
 
 	last, ok := m.lastPhoneTime[userID]
 	if ok && time.Since(last) < 3*time.Second {
@@ -201,6 +227,21 @@ func (m *Manager) checkPhoneRateLimit(userID int64) error {
 
 	m.lastPhoneTime[userID] = time.Now()
 	return nil
+}
+
+// acquireGlobalPhoneThrottle reserves a slot in the global phone submission token bucket.
+func (m *Manager) acquireGlobalPhoneThrottle() (func(), error) {
+	select {
+	case m.globalPhoneSem <- struct{}{}:
+		return func() {
+			go func() {
+				time.Sleep(100 * time.Millisecond) // Pace submissions globally
+				<-m.globalPhoneSem
+			}()
+		}, nil
+	default:
+		return nil, errors.New("system is currently processing high volume of verification requests. Please wait a few moments.")
+	}
 }
 
 // checkCooldown enforces a minimum interval between verification submissions.
@@ -243,6 +284,7 @@ func (m *Manager) recordPasswordAttempt(userID int64, success bool) int {
 func (m *Manager) resetAttempts(userID int64) {
 	m.mu.Lock()
 	delete(m.phoneAttempts, userID)
+	delete(m.lastPhoneTime, userID)
 	delete(m.otpAttempts, userID)
 	delete(m.pwdAttempts, userID)
 	delete(m.lastAttempt, userID)
@@ -353,8 +395,14 @@ func (m *Manager) SelectProvider(ctx context.Context, userID int64, providerInpu
 func (m *Manager) GetOrInitProvider(ctx context.Context, userID int64) (providers.Provider, error) {
 	m.mu.Lock()
 	if p, ok := m.activeProviders[userID]; ok && p != nil {
-		m.mu.Unlock()
-		return p, nil
+		if p.IsAlive() {
+			m.mu.Unlock()
+			return p, nil
+		}
+		// Active provider is dead or closed; evict, cleanup, and re-instantiate cleanly
+		slog.Warn("Active provider is dead or worker process closed; re-instantiating", "user_id", userID, "provider", p.Name())
+		go p.Cleanup()
+		delete(m.activeProviders, userID)
 	}
 
 	pending, hasPending := m.pendingInits[userID]
@@ -366,21 +414,29 @@ func (m *Manager) GetOrInitProvider(ctx context.Context, userID int64) (provider
 			if pending.err != nil {
 				return nil, pending.err
 			}
-			return pending.provider, nil
+			if pending.provider != nil && pending.provider.IsAlive() {
+				return pending.provider, nil
+			}
+			// Pre-warmed provider completed but is no longer alive; fall through to synchronous re-creation
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
 
-	// If no provider is active or pending, instantiate synchronously
+	// If no provider is active or pending, instantiate synchronously with resource admission
 	sess := m.store.Get(userID)
 	if sess == nil || sess.ProviderName == "" {
 		return nil, errors.New("no provider selected for session")
 	}
 
 	canonical := providers.NormalizeName(sess.ProviderName)
+	if err := m.acquireSlot(ctx, userID); err != nil {
+		return nil, err
+	}
+
 	p, err := providers.Get(ctx, canonical, m.cfg.APIID, m.cfg.APIHash, m.cfg.PythonPath, m.cfg.WorkerTimeout)
 	if err != nil {
+		m.releaseSlot(userID)
 		return nil, err
 	}
 
@@ -439,10 +495,16 @@ func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone str
 		return nil, errors.New("not awaiting a phone number")
 	}
 
-	// 3. Priority 4: Enforce phone submission rate limiting (3s cooldown and max attempts ceiling)
+	// 3. Priority 4: Enforce phone submission rate limiting (global throttle, 3s cooldown, and max attempts)
 	if err := m.checkPhoneRateLimit(userID); err != nil {
 		return nil, err
 	}
+
+	releaseThrottle, err := m.acquireGlobalPhoneThrottle()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseThrottle()
 
 	// 4. Begin single-flight user operation with cancellation support (Priority 9)
 	opCtx, unlock, err := m.beginUserOpWithCancel(ctx, userID)
@@ -458,10 +520,13 @@ func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone str
 
 	p, err := m.GetOrInitProvider(opCtx, userID)
 	if err != nil {
+		m.releaseSlot(userID)
 		return nil, fmt.Errorf("provider initialization failed: %w", err)
 	}
 
-	_ = m.store.SetState(userID, StateRequestingCode)
+	if err := m.store.SetState(userID, StateRequestingCode); err != nil {
+		return nil, err
+	}
 
 	slog.Info("Requesting login code", "provider", p.Name(), "phone", security.RedactPhone(cleanedPhone))
 	res, err := p.StartPhoneAuth(opCtx, cleanedPhone)
@@ -480,13 +545,24 @@ func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone str
 		s.PhoneNumber = cleanedPhone
 		s.PhoneCodeHash = res.PhoneCodeHash
 	})
-	_ = m.store.SetState(userID, StateAwaitingOTP)
+	if err := m.store.SetState(userID, StateAwaitingOTP); err != nil {
+		return nil, err
+	}
 
 	return res, nil
 }
 
 // StartQRAuth begins QR code authentication and generates PNG bytes of the QR code.
 func (m *Manager) StartQRAuth(ctx context.Context, userID int64) (*providers.AuthResult, []byte, error) {
+	// Priority 3: Validate session state before acquiring admission slot
+	sess := m.store.Get(userID)
+	if sess == nil {
+		return nil, nil, errors.New("session not found")
+	}
+	if sess.State != StateSelectingAuthMethod && sess.State != StateAwaitingQRAuthentication {
+		return nil, nil, errors.New("not awaiting QR code authentication")
+	}
+
 	opCtx, unlock, err := m.beginUserOpWithCancel(ctx, userID)
 	if err != nil {
 		return nil, nil, err
@@ -497,17 +573,14 @@ func (m *Manager) StartQRAuth(ctx context.Context, userID int64) (*providers.Aut
 		return nil, nil, err
 	}
 
-	sess := m.store.Get(userID)
-	if sess == nil {
-		return nil, nil, errors.New("session not found")
-	}
-
 	p, err := m.GetOrInitProvider(opCtx, userID)
 	if err != nil {
+		m.releaseSlot(userID)
 		return nil, nil, fmt.Errorf("provider initialization failed: %w", err)
 	}
 
 	if !p.SupportsQR() {
+		m.releaseSlot(userID)
 		return nil, nil, providers.ErrQRUnsupported
 	}
 
@@ -526,24 +599,35 @@ func (m *Manager) StartQRAuth(ctx context.Context, userID int64) (*providers.Aut
 		return nil, nil, fmt.Errorf("failed to encode QR code image: %w", err)
 	}
 
-	_ = m.store.SetState(userID, StateAwaitingQRAuthentication)
+	if err := m.store.SetState(userID, StateAwaitingQRAuthentication); err != nil {
+		return nil, nil, err
+	}
 	return res, pngBytes, nil
 }
 
 // WaitForQRLogin blocks until QR code is scanned or expires.
 func (m *Manager) WaitForQRLogin(ctx context.Context, userID int64) (*providers.AuthResult, error) {
-	p, err := m.GetOrInitProvider(ctx, userID)
+	// Priority 7: Coordinate with beginUserOpWithCancel so cancellation immediately cancels QR wait
+	opCtx, unlock, err := m.beginUserOpWithCancel(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	p, err := m.GetOrInitProvider(opCtx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("provider initialization failed: %w", err)
 	}
 
-	res, err := p.WaitForQRLogin(ctx)
+	res, err := p.WaitForQRLogin(opCtx)
 	if err != nil {
 		return nil, err
 	}
 
 	if res.Status == providers.StatusNeedPassword {
-		_ = m.store.SetState(userID, StateAwaitingTwoFactorPassword)
+		if err := m.store.SetState(userID, StateAwaitingTwoFactorPassword); err != nil {
+			return nil, err
+		}
 	}
 
 	return res, nil
@@ -588,7 +672,9 @@ func (m *Manager) SubmitOTP(ctx context.Context, userID int64, otpCode string) (
 
 	m.recordOTPAttempt(userID, true)
 	if res.Status == providers.StatusNeedPassword {
-		_ = m.store.SetState(userID, StateAwaitingTwoFactorPassword)
+		if err := m.store.SetState(userID, StateAwaitingTwoFactorPassword); err != nil {
+			return nil, err
+		}
 		return res, nil
 	}
 
@@ -658,7 +744,10 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	}
 
 	// 1. Login Verification on the authenticated client
-	_ = m.store.SetState(userID, StateValidatingSession)
+	if err := m.store.SetState(userID, StateValidatingSession); err != nil {
+		m.Cleanup(userID)
+		return nil, 0, err
+	}
 	slog.Info("Verifying authenticated account login", "provider", p.Name())
 	authAccount, err := p.GetAccountInfo(opCtx)
 	if err != nil {
@@ -673,7 +762,10 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	}
 
 	// 2. Export native string session
-	_ = m.store.SetState(userID, StateGeneratingSession)
+	if err := m.store.SetState(userID, StateGeneratingSession); err != nil {
+		m.Cleanup(userID)
+		return nil, 0, err
+	}
 	slog.Info("Generating native string session", "provider", p.Name(), "account_id", authAccount.ID)
 	sessionString, err := p.ExportSession(opCtx)
 	if err != nil {
@@ -683,7 +775,10 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	}
 
 	// 3. Fresh client validation
-	_ = m.store.SetState(userID, StateValidatingSession)
+	if err := m.store.SetState(userID, StateValidatingSession); err != nil {
+		m.Cleanup(userID)
+		return nil, 0, err
+	}
 	slog.Info("Validating session with fresh client instance", "provider", p.Name())
 	valAccount, err := p.ValidateSession(opCtx, sessionString)
 	if err != nil {
@@ -700,7 +795,10 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	}
 
 	// 5. Send string session to Telegram Saved Messages & verify delivery
-	_ = m.store.SetState(userID, StateDeliveringSession)
+	if err := m.store.SetState(userID, StateDeliveringSession); err != nil {
+		m.Cleanup(userID)
+		return nil, 0, err
+	}
 	slog.Info("Delivering session to Telegram Saved Messages", "provider", p.Name(), "account_id", authAccount.ID)
 	msgID, err := p.SendToSavedMessages(opCtx, sessionString)
 	if err != nil {
@@ -710,6 +808,10 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	}
 
 	// 6. Complete and safe cleanup
+	if err := m.store.SetState(userID, StateCompleted); err != nil {
+		m.Cleanup(userID)
+		return nil, 0, err
+	}
 	m.Cleanup(userID)
 	_ = m.store.SetState(userID, StateCompleted)
 	slog.Info("Session successfully verified and delivered to Saved Messages", "provider", p.Name(), "account_id", authAccount.ID, "saved_msg_id", msgID)

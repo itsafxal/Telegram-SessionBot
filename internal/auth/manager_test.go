@@ -75,6 +75,9 @@ func (m *mockProvider) Cancel(ctx context.Context) error {
 	m.Cleanup()
 	return nil
 }
+func (m *mockProvider) IsAlive() bool {
+	return !m.cleanupCalled
+}
 func (m *mockProvider) Cleanup() {
 	m.cleanupCalled = true
 }
@@ -142,6 +145,9 @@ func TestCompleteAndDeliverToSavedMessages_Success(t *testing.T) {
 
 	_ = mgr.StartSession(userID)
 	_, _ = mgr.SelectProviderFast(userID, "Telethon")
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+	_ = mgr.store.SetState(userID, StateRequestingCode)
+	_ = mgr.store.SetState(userID, StateAwaitingOTP)
 
 	mock := &mockProvider{
 		name:          "Telethon",
@@ -202,6 +208,9 @@ func TestCompleteAndDeliverToSavedMessages_IdentityMismatch(t *testing.T) {
 
 	_ = mgr.StartSession(userID)
 	_, _ = mgr.SelectProviderFast(userID, "Pyrogram")
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+	_ = mgr.store.SetState(userID, StateRequestingCode)
+	_ = mgr.store.SetState(userID, StateAwaitingOTP)
 
 	mock := &mockProvider{
 		name:          "Pyrogram",
@@ -246,6 +255,9 @@ func TestCompleteAndDeliverToSavedMessages_LoginVerificationFails(t *testing.T) 
 
 	_ = mgr.StartSession(userID)
 	_, _ = mgr.SelectProviderFast(userID, "Gogram")
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+	_ = mgr.store.SetState(userID, StateRequestingCode)
+	_ = mgr.store.SetState(userID, StateAwaitingOTP)
 
 	mock := &mockProvider{
 		name:          "Gogram",
@@ -274,6 +286,9 @@ func TestCompleteAndDeliverToSavedMessages_DeliveryFails(t *testing.T) {
 
 	_ = mgr.StartSession(userID)
 	_, _ = mgr.SelectProviderFast(userID, "Gogram")
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+	_ = mgr.store.SetState(userID, StateRequestingCode)
+	_ = mgr.store.SetState(userID, StateAwaitingOTP)
 
 	mock := &mockProvider{
 		name:          "Gogram",
@@ -629,5 +644,101 @@ func TestCancellationCoordination(t *testing.T) {
 
 	if !mock.cleanupCalled {
 		t.Fatalf("expected provider Cleanup to be called")
+	}
+}
+
+func TestDeadProviderEvictionAndReinitialization(t *testing.T) {
+	mgr := newTestManager()
+	userID := int64(7001)
+
+	// Set session provider to a registered mock provider
+	providers.Register("test_revive", func(ctx context.Context, apiID int32, apiHash string, pythonPath string, timeout time.Duration) (providers.Provider, error) {
+		return &mockProvider{name: "TestRevive"}, nil
+	})
+
+	_ = mgr.store.SetState(userID, StateSelectingProvider)
+	_ = mgr.store.Update(userID, func(s *UserSession) {
+		s.ProviderName = "test_revive"
+	})
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+
+	// Inject a dead provider into activeProviders
+	deadMock := &mockProvider{name: "DeadOldProv", cleanupCalled: true} // IsAlive() returns false
+	mgr.mu.Lock()
+	mgr.activeProviders[userID] = deadMock
+	mgr.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// GetOrInitProvider should detect dead provider, evict it, and instantiate fresh one
+	p, err := mgr.GetOrInitProvider(ctx, userID)
+	if err != nil {
+		t.Fatalf("unexpected error from GetOrInitProvider: %v", err)
+	}
+
+	if p == deadMock {
+		t.Errorf("expected dead provider to be replaced, but got same dead instance")
+	}
+	if !p.IsAlive() {
+		t.Errorf("expected new provider to be alive")
+	}
+	if p.Name() != "TestRevive" {
+		t.Errorf("expected revived provider TestRevive, got %s", p.Name())
+	}
+}
+
+func TestGlobalPhoneSubmissionThrottle(t *testing.T) {
+	mgr := newTestManager()
+	userID := int64(8001)
+
+	_ = mgr.store.SetState(userID, StateSelectingProvider)
+	_ = mgr.store.Update(userID, func(s *UserSession) {
+		s.ProviderName = "test_instant"
+	})
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+
+	// Artificially saturate the global phone submission throttle semaphore (capacity 15)
+	for i := 0; i < cap(mgr.globalPhoneSem); i++ {
+		mgr.globalPhoneSem <- struct{}{}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := mgr.StartPhoneAuth(ctx, userID, "+1234567890")
+	if err == nil {
+		t.Fatalf("expected throttle error when semaphore is saturated, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "processing high volume") {
+		t.Errorf("expected high volume throttle message, got: %v", err)
+	}
+
+	// Drain semaphore
+	for i := 0; i < cap(mgr.globalPhoneSem); i++ {
+		<-mgr.globalPhoneSem
+	}
+}
+
+func TestStartQRAuthStateValidationBeforeSlot(t *testing.T) {
+	mgr := newTestManager()
+	userID := int64(9001)
+
+	// User is in StateIdle
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, _, err := mgr.StartQRAuth(ctx, userID)
+	if err == nil {
+		t.Fatalf("expected error starting QR in Idle state, got nil")
+	}
+
+	// Verify no slot was leaked
+	mgr.mu.Lock()
+	held := mgr.heldSlots[userID]
+	mgr.mu.Unlock()
+	if held {
+		t.Errorf("admission slot was leaked after invalid state in StartQRAuth")
 	}
 }

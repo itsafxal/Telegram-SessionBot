@@ -32,13 +32,19 @@ type AuthHealth struct {
 	ActiveSessions int `json:"active_sessions"`
 }
 
+// SafePollingStatus exposes only sanitized polling health without leaking Telegram IDs or error strings.
+type SafePollingStatus struct {
+	State   string `json:"state"`
+	IsAlive bool   `json:"is_alive"`
+}
+
 // Report holds the minimal, safe public health response for /health without leaking internal architecture or credentials.
 type Report struct {
-	Status        OverallStatus  `json:"status"`
-	Service       string         `json:"service"`
-	UptimeSeconds float64        `json:"uptime_seconds"`
-	Timestamp     time.Time      `json:"timestamp"`
-	Polling       polling.Status `json:"polling"`
+	Status        OverallStatus     `json:"status"`
+	Service       string            `json:"service"`
+	UptimeSeconds float64           `json:"uptime_seconds"`
+	Timestamp     time.Time         `json:"timestamp"`
+	Polling       SafePollingStatus `json:"polling"`
 }
 
 // Monitor coordinates health checks across all subsystems.
@@ -163,7 +169,10 @@ func (m *Monitor) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		Service:       "universal-session-generator",
 		UptimeSeconds: time.Since(m.startTime).Seconds(),
 		Timestamp:     time.Now().UTC(),
-		Polling:       pollStatus,
+		Polling: SafePollingStatus{
+			State:   string(pollStatus.State),
+			IsAlive: pollStatus.IsAlive,
+		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
