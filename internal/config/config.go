@@ -23,6 +23,8 @@ type Config struct {
 	Port                  string
 	WorkerTimeout         time.Duration
 	MaxConcurrentAuth     int
+	SlotAcquireTimeout    time.Duration
+	PhoneMaxAttempts      int
 	LogLevel              string
 	SessionExpiryDuration time.Duration
 }
@@ -54,6 +56,17 @@ func Load() (*Config, error) {
 	mongoURI := strings.TrimSpace(os.Getenv("MONGODB_URI"))
 	if mongoURI == "" {
 		return nil, errors.New("missing required environment variable: MONGODB_URI")
+	}
+
+	insecurePlaceholders := []string{
+		"session_secure_pwd_replace_me",
+		"change_me",
+		":password@",
+	}
+	for _, placeholder := range insecurePlaceholders {
+		if strings.Contains(strings.ToLower(mongoURI), placeholder) {
+			return nil, fmt.Errorf("insecure placeholder credential '%s' detected in MONGODB_URI; please provide a secure unique production password", placeholder)
+		}
 	}
 
 	mongoDB := strings.TrimSpace(os.Getenv("MONGODB_DATABASE"))
@@ -94,6 +107,20 @@ func Load() (*Config, error) {
 		}
 	}
 
+	slotTimeoutSec := 5
+	if slotStr := strings.TrimSpace(os.Getenv("SLOT_ACQUIRE_TIMEOUT_SECONDS")); slotStr != "" {
+		if s, err := strconv.Atoi(slotStr); err == nil && s > 0 {
+			slotTimeoutSec = s
+		}
+	}
+
+	phoneMaxAttempts := 5
+	if pStr := strings.TrimSpace(os.Getenv("PHONE_MAX_ATTEMPTS")); pStr != "" {
+		if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+			phoneMaxAttempts = p
+		}
+	}
+
 	logLevel := strings.ToUpper(strings.TrimSpace(os.Getenv("LOG_LEVEL")))
 	if logLevel == "" {
 		logLevel = "INFO"
@@ -110,6 +137,8 @@ func Load() (*Config, error) {
 		Port:                  port,
 		WorkerTimeout:         time.Duration(workerTimeoutSec) * time.Second,
 		MaxConcurrentAuth:     maxAuth,
+		SlotAcquireTimeout:    time.Duration(slotTimeoutSec) * time.Second,
+		PhoneMaxAttempts:      phoneMaxAttempts,
 		LogLevel:              logLevel,
 		SessionExpiryDuration: 10 * time.Minute,
 	}, nil

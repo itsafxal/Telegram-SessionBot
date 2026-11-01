@@ -265,6 +265,6 @@ func (w *WorkerProcess) streamStderr() {
 	for scanner.Scan() {
 		line := scanner.Text()
 		sanitized := security.SanitizeLogText(line)
-		slog.Debug(fmt.Sprintf("[%s worker] %s", w.workerType, sanitized))
+		slog.Warn(fmt.Sprintf("[%s worker] %s", w.workerType, sanitized))
 	}
 }

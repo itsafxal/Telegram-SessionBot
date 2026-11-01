@@ -108,7 +108,7 @@ func (m *Monitor) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ready":           false,
-			"database_error":  errString(dbErr),
+			"database_ready":  dbErr == nil,
 			"polling_healthy": pollingHealthy,
 		})
 		return
@@ -118,7 +118,7 @@ func (m *Monitor) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ready":           true,
 		"polling_healthy": true,
-		"database":        "connected",
+		"database_ready":  true,
 	})
 }
 
@@ -127,13 +127,12 @@ func (m *Monitor) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
-	// 1. Database check
+	// 1. Database check (redact raw errors to prevent information disclosure)
 	dbHealth := DatabaseHealth{Status: "connected"}
 	dbStart := time.Now()
 	if m.db != nil {
 		if err := m.db.Ping(ctx); err != nil {
 			dbHealth.Status = "disconnected"
-			dbHealth.Error = err.Error()
 		} else {
 			dbHealth.LatencyMS = float64(time.Since(dbStart).Microseconds()) / 1000.0
 		}

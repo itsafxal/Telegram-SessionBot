@@ -1,7 +1,7 @@
 # ==========================================
 # Stage 1: Build the Go binary
 # ==========================================
-FROM golang:alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 # Enable automatic Go toolchain management
 ENV GOTOOLCHAIN=auto

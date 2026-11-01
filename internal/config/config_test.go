@@ -52,3 +52,16 @@ func TestConfigValid(t *testing.T) {
 		t.Errorf("SafeString leaked full BOT_TOKEN: %s", safe)
 	}
 }
+
+func TestConfigInsecureMongoURI(t *testing.T) {
+	os.Setenv("BOT_TOKEN", "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ123456789")
+	os.Setenv("API_ID", "123456")
+	os.Setenv("API_HASH", "abcdef0123456789abcdef0123456789")
+	os.Setenv("OWNER_ID", "99887766")
+	os.Setenv("MONGODB_URI", "mongodb://admin:session_secure_pwd_replace_me@localhost:27017")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "insecure placeholder") {
+		t.Fatalf("expected error detecting placeholder password in MONGODB_URI, got: %v", err)
+	}
+}

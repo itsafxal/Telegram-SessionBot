@@ -83,6 +83,8 @@ func newTestManager() *Manager {
 	cfg := &config.Config{
 		SessionExpiryDuration: 5 * time.Minute,
 		WorkerTimeout:         2 * time.Second,
+		MaxConcurrentAuth:     100,
+		SlotAcquireTimeout:    5 * time.Second,
 		APIID:                 12345,
 		APIHash:               "test_api_hash",
 		PythonPath:            "python",
@@ -109,17 +111,18 @@ func TestSelectProviderFastLatency(t *testing.T) {
 		}
 
 		start := time.Now()
-		supportsQR, err := mgr.SelectProviderFast(uid, "Pyrogram")
+		supportsQR, err := mgr.SelectProviderFast(uid, "test_instant")
 		elapsed := time.Since(start)
 
 		if err != nil {
 			t.Fatalf("SelectProviderFast failed: %v", err)
 		}
 		if supportsQR {
-			t.Errorf("Pyrogram should not support QR")
+			t.Errorf("test_instant should not support QR")
 		}
 
 		totalDuration += elapsed
+		mgr.Cleanup(uid)
 
 		if elapsed > 10*time.Millisecond {
 			t.Errorf("iteration %d exceeded 10ms deadline: %v", i, elapsed)
@@ -444,4 +447,187 @@ func TestConcurrentSessionAccessUnderRace(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestConcurrencyAdmissionLimit(t *testing.T) {
+	cfg := &config.Config{
+		SessionExpiryDuration: 5 * time.Minute,
+		WorkerTimeout:         2 * time.Second,
+		MaxConcurrentAuth:     2,
+		SlotAcquireTimeout:    50 * time.Millisecond,
+		APIID:                 12345,
+		APIHash:               "test_api_hash",
+		PythonPath:            "python",
+	}
+	mgr := NewManager(cfg)
+
+	providers.Register("test_slot_provider", func(ctx context.Context, apiID int32, apiHash string, pythonPath string, timeout time.Duration) (providers.Provider, error) {
+		return &mockProvider{name: "TestSlot"}, nil
+	})
+
+	user1 := int64(1001)
+	user2 := int64(1002)
+	user3 := int64(1003)
+
+	_ = mgr.StartSession(user1)
+	_ = mgr.StartSession(user2)
+	_ = mgr.StartSession(user3)
+
+	_, err1 := mgr.SelectProviderFast(user1, "test_slot_provider")
+	if err1 != nil {
+		t.Fatalf("user1 expected success, got: %v", err1)
+	}
+
+	_, err2 := mgr.SelectProviderFast(user2, "test_slot_provider")
+	if err2 != nil {
+		t.Fatalf("user2 expected success, got: %v", err2)
+	}
+
+	// Slot limit 2 is now saturated: user3 MUST be rejected
+	_, err3 := mgr.SelectProviderFast(user3, "test_slot_provider")
+	if err3 == nil || !strings.Contains(err3.Error(), "maximum concurrent authentications reached") {
+		t.Fatalf("expected concurrency admission failure for user3, got: %v", err3)
+	}
+
+	// Cancel user1 to free a slot
+	_ = mgr.Cancel(context.Background(), user1)
+
+	// User 3 must now succeed
+	_, err3Retry := mgr.SelectProviderFast(user3, "test_slot_provider")
+	if err3Retry != nil {
+		t.Fatalf("expected user3 to succeed after slot released, got: %v", err3Retry)
+	}
+}
+
+func TestInvalidPhoneValidationNoSlotLeak(t *testing.T) {
+	cfg := &config.Config{
+		SessionExpiryDuration: 5 * time.Minute,
+		WorkerTimeout:         2 * time.Second,
+		MaxConcurrentAuth:     1,
+		SlotAcquireTimeout:    50 * time.Millisecond,
+		APIID:                 12345,
+		APIHash:               "test_api_hash",
+		PythonPath:            "python",
+	}
+	mgr := NewManager(cfg)
+
+	userID := int64(2001)
+	_ = mgr.StartSession(userID)
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+
+	// Invalid phone submissions
+	_, errInvalid := mgr.StartPhoneAuth(context.Background(), userID, "invalid-phone")
+	if errInvalid == nil || !strings.Contains(errInvalid.Error(), "invalid phone number format") {
+		t.Fatalf("expected phone validation error, got: %v", errInvalid)
+	}
+
+	// Held slots map MUST remain empty for this user
+	mgr.mu.Lock()
+	held := mgr.heldSlots[userID]
+	mgr.mu.Unlock()
+	if held {
+		t.Fatalf("expected slot to NOT be held after failed phone validation")
+	}
+}
+
+func TestPhoneNumberRateLimiting(t *testing.T) {
+	cfg := &config.Config{
+		SessionExpiryDuration: 5 * time.Minute,
+		WorkerTimeout:         2 * time.Second,
+		MaxConcurrentAuth:     5,
+		SlotAcquireTimeout:    50 * time.Millisecond,
+		PhoneMaxAttempts:      2,
+		APIID:                 12345,
+		APIHash:               "test_api_hash",
+		PythonPath:            "python",
+	}
+	mgr := NewManager(cfg)
+
+	providers.Register("test_rate_prov", func(ctx context.Context, apiID int32, apiHash string, pythonPath string, timeout time.Duration) (providers.Provider, error) {
+		return &mockProvider{name: "TestRate"}, nil
+	})
+
+	userID := int64(3001)
+	_ = mgr.StartSession(userID)
+	_, _ = mgr.SelectProviderFast(userID, "test_rate_prov")
+
+	// 1. Submit first phone
+	_, err1 := mgr.StartPhoneAuth(context.Background(), userID, "+12345678901")
+	if err1 != nil {
+		t.Fatalf("first phone attempt expected success, got: %v", err1)
+	}
+
+	// 2. Immediate second submission must trigger cooldown
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+	_, err2 := mgr.StartPhoneAuth(context.Background(), userID, "+12345678902")
+	if err2 == nil || !strings.Contains(err2.Error(), "please wait a few seconds") {
+		t.Fatalf("expected cooldown error, got: %v", err2)
+	}
+
+	// Bypass cooldown to test max attempts
+	mgr.mu.Lock()
+	delete(mgr.lastPhoneTime, userID)
+	mgr.mu.Unlock()
+
+	// 3. Second attempt
+	_, err3 := mgr.StartPhoneAuth(context.Background(), userID, "+12345678903")
+	if err3 != nil {
+		t.Fatalf("expected second attempt to succeed, got: %v", err3)
+	}
+
+	// Bypass cooldown
+	mgr.mu.Lock()
+	delete(mgr.lastPhoneTime, userID)
+	mgr.mu.Unlock()
+
+	// 4. Third attempt exceeds PhoneMaxAttempts (2)
+	_ = mgr.store.SetState(userID, StateAwaitingPhoneNumber)
+	_, err4 := mgr.StartPhoneAuth(context.Background(), userID, "+12345678904")
+	if err4 == nil || !strings.Contains(err4.Error(), "maximum phone submission attempts exceeded") {
+		t.Fatalf("expected max attempts exceeded error, got: %v", err4)
+	}
+}
+
+func TestCancellationCoordination(t *testing.T) {
+	mgr := newTestManager()
+	userID := int64(4001)
+
+	_ = mgr.StartSession(userID)
+	mock := &mockProvider{name: "TestCancelProv"}
+	mgr.mu.Lock()
+	mgr.activeProviders[userID] = mock
+	mgr.mu.Unlock()
+
+	// Start simulated operation
+	opCtx, cleanup, err := mgr.beginUserOpWithCancel(context.Background(), userID)
+	if err != nil {
+		t.Fatalf("failed to begin user op: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer cleanup()
+		select {
+		case <-opCtx.Done():
+		case <-time.After(2 * time.Second):
+		}
+		close(done)
+	}()
+
+	// Call Cancel while operation is running
+	cancelErr := mgr.Cancel(context.Background(), userID)
+	if cancelErr != nil {
+		t.Fatalf("Cancel returned error: %v", cancelErr)
+	}
+
+	// Wait for op goroutine to terminate
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("operation did not terminate on cancel")
+	}
+
+	if !mock.cleanupCalled {
+		t.Fatalf("expected provider Cleanup to be called")
+	}
 }

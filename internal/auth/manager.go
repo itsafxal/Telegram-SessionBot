@@ -33,8 +33,11 @@ type Manager struct {
 	pendingInits    map[int64]*pendingInit
 	heldSlots       map[int64]bool
 	userOps         map[int64]chan struct{}
+	userCancels     map[int64]context.CancelFunc
+	cancelling      map[int64]bool
 	authSem         chan struct{}
 	phoneAttempts   map[int64]int
+	lastPhoneTime   map[int64]time.Time
 	otpAttempts     map[int64]int
 	pwdAttempts     map[int64]int
 	lastAttempt     map[int64]time.Time
@@ -54,8 +57,11 @@ func NewManager(cfg *config.Config) *Manager {
 		pendingInits:    make(map[int64]*pendingInit),
 		heldSlots:       make(map[int64]bool),
 		userOps:         make(map[int64]chan struct{}),
+		userCancels:     make(map[int64]context.CancelFunc),
+		cancelling:      make(map[int64]bool),
 		authSem:         make(chan struct{}, maxAuth),
 		phoneAttempts:   make(map[int64]int),
+		lastPhoneTime:   make(map[int64]time.Time),
 		otpAttempts:     make(map[int64]int),
 		pwdAttempts:     make(map[int64]int),
 		lastAttempt:     make(map[int64]time.Time),
@@ -90,6 +96,14 @@ func (m *Manager) acquireSlot(ctx context.Context, userID int64) error {
 	}
 	m.mu.Unlock()
 
+	timeout := m.cfg.SlotAcquireTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case m.authSem <- struct{}{}:
 		m.mu.Lock()
@@ -106,15 +120,13 @@ func (m *Manager) acquireSlot(ctx context.Context, userID int64) error {
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("concurrency wait cancelled: %w", ctx.Err())
-	default:
+	case <-timer.C:
 		return errors.New("maximum concurrent authentications reached; please try again in a few moments")
 	}
 }
 
-// releaseSlot safely returns an authentication slot to the global semaphore.
-func (m *Manager) releaseSlot(userID int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// releaseSlotLocked safely returns an authentication slot when m.mu is already held.
+func (m *Manager) releaseSlotLocked(userID int64) {
 	if m.heldSlots[userID] {
 		delete(m.heldSlots, userID)
 		select {
@@ -124,23 +136,71 @@ func (m *Manager) releaseSlot(userID int64) {
 	}
 }
 
-// beginUserOp guarantees that only one authentication operation runs at a time per user.
-func (m *Manager) beginUserOp(userID int64) (func(), error) {
+// releaseSlot safely returns an authentication slot to the global semaphore.
+func (m *Manager) releaseSlot(userID int64) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseSlotLocked(userID)
+}
+
+// beginUserOpWithCancel creates an operation context and coordinates cancelation safety.
+func (m *Manager) beginUserOpWithCancel(parentCtx context.Context, userID int64) (context.Context, func(), error) {
+	m.mu.Lock()
+	if m.cancelling[userID] {
+		m.mu.Unlock()
+		return nil, nil, errors.New("operation is being cancelled")
+	}
 	if _, busy := m.userOps[userID]; busy {
 		m.mu.Unlock()
-		return nil, errors.New("another operation is currently processing for this session. Please wait.")
+		return nil, nil, errors.New("another operation is currently processing for this session. Please wait.")
 	}
 	done := make(chan struct{})
 	m.userOps[userID] = done
+
+	opCtx, cancelFn := context.WithCancel(parentCtx)
+	m.userCancels[userID] = cancelFn
 	m.mu.Unlock()
 
-	return func() {
+	cleanup := func() {
+		cancelFn()
 		m.mu.Lock()
 		delete(m.userOps, userID)
+		delete(m.userCancels, userID)
 		close(done)
 		m.mu.Unlock()
-	}, nil
+	}
+
+	return opCtx, cleanup, nil
+}
+
+// beginUserOp guarantees that only one authentication operation runs at a time per user.
+func (m *Manager) beginUserOp(userID int64) (func(), error) {
+	_, cleanup, err := m.beginUserOpWithCancel(context.Background(), userID)
+	return cleanup, err
+}
+
+// checkPhoneRateLimit enforces cooldown and max attempts ceiling for phone submissions.
+func (m *Manager) checkPhoneRateLimit(userID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	last, ok := m.lastPhoneTime[userID]
+	if ok && time.Since(last) < 3*time.Second {
+		return errors.New("please wait a few seconds before submitting another phone number")
+	}
+
+	maxAttempts := m.cfg.PhoneMaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+
+	m.phoneAttempts[userID]++
+	if m.phoneAttempts[userID] > maxAttempts {
+		return errors.New("maximum phone submission attempts exceeded; session aborted for security")
+	}
+
+	m.lastPhoneTime[userID] = time.Now()
+	return nil
 }
 
 // checkCooldown enforces a minimum interval between verification submissions.
@@ -208,6 +268,17 @@ func (m *Manager) SelectProviderFast(userID int64, providerInput string) (bool, 
 		return false, errors.New("please start a new session before selecting a provider")
 	}
 
+	// Priority 2: Enforce concurrency admission before pre-warming heavy worker processes
+	slotTimeout := m.cfg.SlotAcquireTimeout
+	if slotTimeout <= 0 {
+		slotTimeout = 5 * time.Second
+	}
+	acquireCtx, cancel := context.WithTimeout(context.Background(), slotTimeout)
+	defer cancel()
+	if err := m.acquireSlot(acquireCtx, userID); err != nil {
+		return false, err
+	}
+
 	supportsQR := providers.SupportsQR(canonicalName)
 	_ = m.store.Update(userID, func(s *UserSession) {
 		s.ProviderName = providers.DisplayName(canonicalName)
@@ -245,6 +316,8 @@ func (m *Manager) SelectProviderFast(userID int64, providerInput string) (bool, 
 			delete(m.pendingInits, uid)
 			if err == nil {
 				m.activeProviders[uid] = p
+			} else {
+				m.releaseSlotLocked(uid)
 			}
 			pending.provider = p
 			pending.err = err
@@ -253,6 +326,7 @@ func (m *Manager) SelectProviderFast(userID int64, providerInput string) (bool, 
 			if p != nil {
 				go p.Cleanup()
 			}
+			m.releaseSlotLocked(uid)
 		}
 		close(pending.done)
 		m.mu.Unlock()
@@ -349,16 +423,7 @@ func (m *Manager) ChooseAuthMethod(userID int64, method string) (State, error) {
 
 // StartPhoneAuth validates the phone number and requests an OTP code from Telegram.
 func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone string) (*providers.AuthResult, error) {
-	unlock, err := m.beginUserOp(userID)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
-
-	if err := m.acquireSlot(ctx, userID); err != nil {
-		return nil, err
-	}
-
+	// 1. Phone number format validation BEFORE acquiring slot or mutating state (Priority 3)
 	cleanedPhone := strings.ReplaceAll(strings.TrimSpace(rawPhone), " ", "")
 	if !strings.HasPrefix(cleanedPhone, "+") {
 		cleanedPhone = "+" + cleanedPhone
@@ -368,12 +433,30 @@ func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone str
 		return nil, errors.New("invalid phone number format. Please provide international format with country code (e.g. +1234567890)")
 	}
 
+	// 2. Validate current state
 	sess := m.store.Get(userID)
 	if sess == nil || sess.State != StateAwaitingPhoneNumber {
 		return nil, errors.New("not awaiting a phone number")
 	}
 
-	p, err := m.GetOrInitProvider(ctx, userID)
+	// 3. Priority 4: Enforce phone submission rate limiting (3s cooldown and max attempts ceiling)
+	if err := m.checkPhoneRateLimit(userID); err != nil {
+		return nil, err
+	}
+
+	// 4. Begin single-flight user operation with cancellation support (Priority 9)
+	opCtx, unlock, err := m.beginUserOpWithCancel(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	// 5. Ensure admission slot is held
+	if err := m.acquireSlot(opCtx, userID); err != nil {
+		return nil, err
+	}
+
+	p, err := m.GetOrInitProvider(opCtx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("provider initialization failed: %w", err)
 	}
@@ -381,8 +464,9 @@ func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone str
 	_ = m.store.SetState(userID, StateRequestingCode)
 
 	slog.Info("Requesting login code", "provider", p.Name(), "phone", security.RedactPhone(cleanedPhone))
-	res, err := p.StartPhoneAuth(ctx, cleanedPhone)
+	res, err := p.StartPhoneAuth(opCtx, cleanedPhone)
 	if err != nil {
+		// Priority 5 bug fix: allow recovery on code dispatch error
 		_ = m.store.SetState(userID, StateAwaitingPhoneNumber)
 		return nil, err
 	}
@@ -403,13 +487,13 @@ func (m *Manager) StartPhoneAuth(ctx context.Context, userID int64, rawPhone str
 
 // StartQRAuth begins QR code authentication and generates PNG bytes of the QR code.
 func (m *Manager) StartQRAuth(ctx context.Context, userID int64) (*providers.AuthResult, []byte, error) {
-	unlock, err := m.beginUserOp(userID)
+	opCtx, unlock, err := m.beginUserOpWithCancel(ctx, userID)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer unlock()
 
-	if err := m.acquireSlot(ctx, userID); err != nil {
+	if err := m.acquireSlot(opCtx, userID); err != nil {
 		return nil, nil, err
 	}
 
@@ -418,7 +502,7 @@ func (m *Manager) StartQRAuth(ctx context.Context, userID int64) (*providers.Aut
 		return nil, nil, errors.New("session not found")
 	}
 
-	p, err := m.GetOrInitProvider(ctx, userID)
+	p, err := m.GetOrInitProvider(opCtx, userID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("provider initialization failed: %w", err)
 	}
@@ -427,7 +511,7 @@ func (m *Manager) StartQRAuth(ctx context.Context, userID int64) (*providers.Aut
 		return nil, nil, providers.ErrQRUnsupported
 	}
 
-	res, err := p.StartQRAuth(ctx)
+	res, err := p.StartQRAuth(opCtx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -467,7 +551,7 @@ func (m *Manager) WaitForQRLogin(ctx context.Context, userID int64) (*providers.
 
 // SubmitOTP verifies the user-entered login code with rate limit and attempt tracking.
 func (m *Manager) SubmitOTP(ctx context.Context, userID int64, otpCode string) (*providers.AuthResult, error) {
-	unlock, err := m.beginUserOp(userID)
+	opCtx, unlock, err := m.beginUserOpWithCancel(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -482,13 +566,13 @@ func (m *Manager) SubmitOTP(ctx context.Context, userID int64, otpCode string) (
 		return nil, errors.New("not awaiting a verification code")
 	}
 
-	p, err := m.GetOrInitProvider(ctx, userID)
+	p, err := m.GetOrInitProvider(opCtx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("provider initialization failed: %w", err)
 	}
 
 	slog.Info("Verifying OTP code", "provider", p.Name())
-	res, err := p.SubmitOTP(ctx, strings.TrimSpace(otpCode))
+	res, err := p.SubmitOTP(opCtx, strings.TrimSpace(otpCode))
 	if err != nil {
 		return nil, err
 	}
@@ -496,7 +580,7 @@ func (m *Manager) SubmitOTP(ctx context.Context, userID int64, otpCode string) (
 	if res.Status == providers.StatusError {
 		attempts := m.recordOTPAttempt(userID, false)
 		if attempts >= 3 {
-			_ = m.Cancel(ctx, userID)
+			_ = m.Cancel(opCtx, userID)
 			return nil, errors.New("too many failed verification code attempts. Your authentication session has been terminated for security. Please restart with /start.")
 		}
 		return res, nil
@@ -513,7 +597,7 @@ func (m *Manager) SubmitOTP(ctx context.Context, userID int64, otpCode string) (
 
 // SubmitPassword verifies the two-step verification password with attempt tracking.
 func (m *Manager) SubmitPassword(ctx context.Context, userID int64, password string) (*providers.AuthResult, error) {
-	unlock, err := m.beginUserOp(userID)
+	opCtx, unlock, err := m.beginUserOpWithCancel(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -528,13 +612,13 @@ func (m *Manager) SubmitPassword(ctx context.Context, userID int64, password str
 		return nil, errors.New("not awaiting a two-step verification password")
 	}
 
-	p, err := m.GetOrInitProvider(ctx, userID)
+	p, err := m.GetOrInitProvider(opCtx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("provider initialization failed: %w", err)
 	}
 
 	slog.Info("Verifying 2FA password", "provider", p.Name())
-	res, err := p.SubmitPassword(ctx, password)
+	res, err := p.SubmitPassword(opCtx, password)
 	if err != nil {
 		return nil, err
 	}
@@ -542,7 +626,7 @@ func (m *Manager) SubmitPassword(ctx context.Context, userID int64, password str
 	if res.Status == providers.StatusError {
 		attempts := m.recordPasswordAttempt(userID, false)
 		if attempts >= 3 {
-			_ = m.Cancel(ctx, userID)
+			_ = m.Cancel(opCtx, userID)
 			return nil, errors.New("too many failed two-step verification attempts. Your authentication session has been terminated for security. Please restart with /start.")
 		}
 		return res, nil
@@ -555,7 +639,7 @@ func (m *Manager) SubmitPassword(ctx context.Context, userID int64, password str
 // CompleteAndDeliverToSavedMessages verifies login, generates native session, validates fresh client,
 // delivers to Saved Messages, and verifies delivery.
 func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID int64) (*providers.AccountInfo, int64, error) {
-	unlock, err := m.beginUserOp(userID)
+	opCtx, unlock, err := m.beginUserOpWithCancel(ctx, userID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -566,7 +650,7 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 		return nil, 0, errors.New("no active session found")
 	}
 
-	p, err := m.GetOrInitProvider(ctx, userID)
+	p, err := m.GetOrInitProvider(opCtx, userID)
 	if err != nil {
 		_ = m.store.SetState(userID, StateFailed)
 		m.Cleanup(userID)
@@ -576,7 +660,7 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	// 1. Login Verification on the authenticated client
 	_ = m.store.SetState(userID, StateValidatingSession)
 	slog.Info("Verifying authenticated account login", "provider", p.Name())
-	authAccount, err := p.GetAccountInfo(ctx)
+	authAccount, err := p.GetAccountInfo(opCtx)
 	if err != nil {
 		_ = m.store.SetState(userID, StateFailed)
 		m.Cleanup(userID)
@@ -591,7 +675,7 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	// 2. Export native string session
 	_ = m.store.SetState(userID, StateGeneratingSession)
 	slog.Info("Generating native string session", "provider", p.Name(), "account_id", authAccount.ID)
-	sessionString, err := p.ExportSession(ctx)
+	sessionString, err := p.ExportSession(opCtx)
 	if err != nil {
 		_ = m.store.SetState(userID, StateFailed)
 		m.Cleanup(userID)
@@ -601,7 +685,7 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	// 3. Fresh client validation
 	_ = m.store.SetState(userID, StateValidatingSession)
 	slog.Info("Validating session with fresh client instance", "provider", p.Name())
-	valAccount, err := p.ValidateSession(ctx, sessionString)
+	valAccount, err := p.ValidateSession(opCtx, sessionString)
 	if err != nil {
 		_ = m.store.SetState(userID, StateFailed)
 		m.Cleanup(userID)
@@ -618,7 +702,7 @@ func (m *Manager) CompleteAndDeliverToSavedMessages(ctx context.Context, userID 
 	// 5. Send string session to Telegram Saved Messages & verify delivery
 	_ = m.store.SetState(userID, StateDeliveringSession)
 	slog.Info("Delivering session to Telegram Saved Messages", "provider", p.Name(), "account_id", authAccount.ID)
-	msgID, err := p.SendToSavedMessages(ctx, sessionString)
+	msgID, err := p.SendToSavedMessages(opCtx, sessionString)
 	if err != nil {
 		_ = m.store.SetState(userID, StateFailed)
 		m.Cleanup(userID)
@@ -645,20 +729,40 @@ func (m *Manager) CompleteAndValidate(ctx context.Context, userID int64) (string
 // Cancel terminates active authentication and cleans up all temporary state.
 func (m *Manager) Cancel(ctx context.Context, userID int64) error {
 	m.mu.Lock()
-	p, ok := m.activeProviders[userID]
-	if ok {
-		delete(m.activeProviders, userID)
-	}
+	m.cancelling[userID] = true
+	cancelFn := m.userCancels[userID]
+	opDone := m.userOps[userID]
+	p, hasProvider := m.activeProviders[userID]
+	delete(m.activeProviders, userID)
 	delete(m.pendingInits, userID)
 	m.mu.Unlock()
+
+	// Trigger cancellation of active in-flight worker operation (Priority 9)
+	if cancelFn != nil {
+		cancelFn()
+	}
+
+	// Wait up to 1.5 seconds for active operation goroutine to exit gracefully
+	if opDone != nil {
+		select {
+		case <-opDone:
+		case <-time.After(1500 * time.Millisecond):
+			slog.Warn("Timed out waiting for in-flight user op during cancellation", "user_id", userID)
+		}
+	}
 
 	m.releaseSlot(userID)
 	m.resetAttempts(userID)
 
-	if ok && p != nil {
+	if hasProvider && p != nil {
 		_ = p.Cancel(ctx)
 		p.Cleanup()
 	}
+
+	m.mu.Lock()
+	delete(m.cancelling, userID)
+	delete(m.userCancels, userID)
+	m.mu.Unlock()
 
 	_ = m.store.SetState(userID, StateCancelled)
 	m.store.Clear(userID)
@@ -669,6 +773,8 @@ func (m *Manager) Cancel(ctx context.Context, userID int64) error {
 // Cleanup releases all provider instances, releases concurrency slots, and removes memory traces.
 func (m *Manager) Cleanup(userID int64) {
 	m.mu.Lock()
+	cancelFn := m.userCancels[userID]
+	opDone := m.userOps[userID]
 	p, ok := m.activeProviders[userID]
 	if ok {
 		delete(m.activeProviders, userID)
@@ -676,12 +782,27 @@ func (m *Manager) Cleanup(userID int64) {
 	delete(m.pendingInits, userID)
 	m.mu.Unlock()
 
+	if cancelFn != nil {
+		cancelFn()
+	}
+	if opDone != nil {
+		select {
+		case <-opDone:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
 	m.releaseSlot(userID)
 	m.resetAttempts(userID)
 
 	if ok && p != nil {
 		p.Cleanup()
 	}
+
+	m.mu.Lock()
+	delete(m.cancelling, userID)
+	delete(m.userCancels, userID)
+	m.mu.Unlock()
 
 	m.store.Clear(userID)
 }

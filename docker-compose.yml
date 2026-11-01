@@ -23,16 +23,18 @@ services:
     container_name: universal-session-mongo
     restart: unless-stopped
     environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-session_admin}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-session_secure_pwd_replace_me}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME environment variable is required}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD environment variable is required}
       MONGO_INITDB_DATABASE: ${MONGODB_DATABASE:-telegram_session_bot}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-session_app_user}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-}
     networks:
       - backend-net
-    # Public 27017 port exposure removed for production network isolation; bot connects via internal bridge network
     volumes:
       - mongo_data:/data/db
+      - ./docker/mongo-init.js:/docker-entrypoint-initdb.d/init-app-user.js:ro
     healthcheck:
-      test: ["CMD", "mongosh", "-u", "${MONGO_INITDB_ROOT_USERNAME:-session_admin}", "-p", "${MONGO_INITDB_ROOT_PASSWORD:-session_secure_pwd_replace_me}", "--authenticationDatabase", "admin", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD", "mongosh", "-u", "${MONGO_ROOT_USERNAME}", "-p", "${MONGO_ROOT_PASSWORD}", "--authenticationDatabase", "admin", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5

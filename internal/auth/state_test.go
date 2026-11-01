@@ -80,3 +80,40 @@ func TestSessionClear(t *testing.T) {
 		t.Fatalf("expected nil after Clear, got %v", sess)
 	}
 }
+
+func TestRetryTransitionsTable(t *testing.T) {
+	store := NewSessionStore(5*time.Minute, nil)
+	userID := int64(112233)
+
+	tests := []struct {
+		name       string
+		fromState  State
+		toState    State
+		shouldPass bool
+	}{
+		// Priority 5 Bug fix: RequestingCode -> AwaitingPhoneNumber MUST succeed
+		{"Retry phone code request", StateRequestingCode, StateAwaitingPhoneNumber, true},
+		{"OTP to phone retry", StateAwaitingOTP, StateAwaitingPhoneNumber, true},
+		{"QR to selecting auth method", StateAwaitingQRAuthentication, StateSelectingAuthMethod, true},
+		{"2FA to OTP retry", StateAwaitingTwoFactorPassword, StateAwaitingOTP, true},
+		{"AwaitingPhoneNumber to DeliveringSession (Illegal)", StateAwaitingPhoneNumber, StateDeliveringSession, false},
+		{"Idle directly to AwaitingOTP (Illegal)", StateIdle, StateAwaitingOTP, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_ = store.GetOrCreate(userID)
+			_ = store.Update(userID, func(s *UserSession) {
+				s.State = tt.fromState
+			})
+
+			err := store.SetState(userID, tt.toState)
+			if tt.shouldPass && err != nil {
+				t.Errorf("expected transition %s -> %s to succeed, got error: %v", tt.fromState, tt.toState, err)
+			}
+			if !tt.shouldPass && err == nil {
+				t.Errorf("expected transition %s -> %s to fail, but succeeded", tt.fromState, tt.toState)
+			}
+		})
+	}
+}

@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import json
+import re
 import sys
 import traceback
 
@@ -14,6 +15,22 @@ from pyrogram.errors import (
     PhoneNumberUnoccupied,
     SessionPasswordNeeded,
 )
+
+PHONE_REGEX = re.compile(r'\+?[1-9]\d{6,14}')
+CODE_REGEX = re.compile(r'\b\d{4,6}\b')
+SESSION_REGEX = re.compile(r'[A-Za-z0-9+/=_-]{40,}')
+HEX_HASH_REGEX = re.compile(r'\b[a-fA-F0-9]{32,64}\b')
+
+
+def sanitize_error(text: str) -> str:
+    """Sanitizes sensitive authentication tokens, phone numbers, and hashes from error messages."""
+    if not text:
+        return ""
+    text = SESSION_REGEX.sub("[REDACTED_SESSION]", text)
+    text = HEX_HASH_REGEX.sub("[REDACTED_HASH]", text)
+    text = PHONE_REGEX.sub("[REDACTED_PHONE]", text)
+    text = CODE_REGEX.sub("[REDACTED_CODE]", text)
+    return text
 
 
 class PyroforkWorker:
@@ -69,7 +86,7 @@ class PyroforkWorker:
         except FloodWait as e:
             return {"status": "error", "error": f"Flood wait error. Please wait {e.value} seconds before retrying."}
         except Exception as e:
-            return {"status": "error", "error": f"Failed to send code: {str(e)}"}
+            return {"status": "error", "error": sanitize_error(f"Failed to send code: {str(e)}")}
 
     async def handle_start_qr(self, payload: dict) -> dict:
         return {
@@ -99,7 +116,7 @@ class PyroforkWorker:
         except FloodWait as e:
             return {"status": "error", "error": f"Flood wait error. Please wait {e.value} seconds before retrying."}
         except Exception as e:
-            return {"status": "error", "error": f"Verification failed: {str(e)}"}
+            return {"status": "error", "error": sanitize_error(f"Verification failed: {str(e)}")}
 
     async def handle_submit_password(self, payload: dict) -> dict:
         if not self.client:
@@ -115,7 +132,7 @@ class PyroforkWorker:
         except FloodWait as e:
             return {"status": "error", "error": f"Flood wait error. Please wait {e.value} seconds."}
         except Exception as e:
-            return {"status": "error", "error": f"2FA verification failed: {str(e)}"}
+            return {"status": "error", "error": sanitize_error(f"2FA verification failed: {str(e)}")}
 
     async def handle_export_session(self, payload: dict) -> dict:
         if not self.client:
@@ -125,7 +142,7 @@ class PyroforkWorker:
             session_str = await self.client.export_session_string()
             return {"status": "ok", "data": {"session": session_str}}
         except Exception as e:
-            return {"status": "error", "error": f"Failed to export session: {str(e)}"}
+            return {"status": "error", "error": sanitize_error(f"Failed to export session: {str(e)}")}
 
     async def handle_validate_session(self, payload: dict) -> dict:
         session_str = str(payload["session"])
@@ -149,7 +166,7 @@ class PyroforkWorker:
                 },
             }
         except Exception as e:
-            return {"status": "error", "error": f"Session validation failed: {str(e)}"}
+            return {"status": "error", "error": sanitize_error(f"Session validation failed: {str(e)}")}
         finally:
             try:
                 if val_client.is_connected:
@@ -226,7 +243,7 @@ class PyroforkWorker:
                 },
             }
         except Exception as e:
-            return {"status": "error", "error": f"Failed to deliver session to Saved Messages: {str(e)}"}
+            return {"status": "error", "error": sanitize_error(f"Failed to deliver session to Saved Messages: {str(e)}")}
 
     async def handle_cancel(self, payload: dict) -> dict:
         if self.client:
@@ -255,15 +272,30 @@ ALLOWED_ACTIONS = {
 }
 
 
+def read_bounded_line(max_len: int = MAX_LINE_LENGTH) -> str | None:
+    """Reads at most max_len+1 chars from sys.stdin to prevent memory DOS, draining overflow safely."""
+    chunk = sys.stdin.readline(max_len + 1)
+    if not chunk:
+        return None
+    if len(chunk) > max_len:
+        # Drain rest of line until newline to maintain parser synchronization
+        while True:
+            extra = sys.stdin.readline(8192)
+            if not extra or extra.endswith('\n'):
+                break
+        return "EXCEEDED_MAX_LENGTH"
+    return chunk
+
+
 async def main():
     worker = PyroforkWorker()
 
     while True:
-        line = await asyncio.to_thread(sys.stdin.readline)
-        if not line:
+        line = await asyncio.to_thread(read_bounded_line, MAX_LINE_LENGTH)
+        if line is None:
             break
 
-        if len(line) > MAX_LINE_LENGTH:
+        if line == "EXCEEDED_MAX_LENGTH":
             sys.stderr.write("IPC message exceeds maximum permitted size\n")
             sys.stderr.flush()
             err_resp = {"id": "", "status": "error", "error": "IPC payload exceeds maximum allowed size"}
@@ -325,9 +357,10 @@ async def main():
             sys.stdout.write(json.dumps(res) + "\n")
             sys.stdout.flush()
         except Exception as e:
-            sys.stderr.write(f"Worker exception during action {action}: {traceback.format_exc()}\n")
+            sanitized_tb = sanitize_error(traceback.format_exc())
+            sys.stderr.write(f"Worker exception during action {action}: {sanitized_tb}\n")
             sys.stderr.flush()
-            err_resp = {"id": req_id, "status": "error", "error": str(e)}
+            err_resp = {"id": req_id, "status": "error", "error": sanitize_error(str(e))}
             sys.stdout.write(json.dumps(err_resp) + "\n")
             sys.stdout.flush()
 
