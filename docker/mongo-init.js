@@ -19,3 +19,4 @@ if (appPwd) {
 } else {
   print('[MongoDB Init] MONGO_APP_PASSWORD not set; skipping dedicated app user creation');
 }
+
